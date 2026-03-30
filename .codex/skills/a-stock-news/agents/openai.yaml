@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股消息监控"
+  short_description: "财经新闻、公告和政策监控"
+  default_prompt: "Use $a-stock-news to get the latest financial news."

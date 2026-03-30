@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.cursor/skills/shared/.cache/
+.codex/skills/a-stock-shared/scripts/.cache/

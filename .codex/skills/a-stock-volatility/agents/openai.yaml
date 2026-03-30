@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股市场波动"
+  short_description: "涨跌停统计和市场情绪分析"
+  default_prompt: "Use $a-stock-volatility to analyze today's market sentiment."

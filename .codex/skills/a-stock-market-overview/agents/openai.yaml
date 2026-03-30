@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股大盘概览"
+  short_description: "获取A股大盘指数和板块行情"
+  default_prompt: "Use $a-stock-market-overview to show today's A-stock market overview."

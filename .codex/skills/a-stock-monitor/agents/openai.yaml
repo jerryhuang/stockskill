@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股个股监控"
+  short_description: "个股行情、K线和技术指标分析"
+  default_prompt: "Use $a-stock-monitor to analyze stock 600519 technical indicators."

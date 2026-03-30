@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股资金流向"
+  short_description: "北向资金和主力资金流向分析"
+  default_prompt: "Use $a-stock-capital-flow to check today's northbound capital flow."

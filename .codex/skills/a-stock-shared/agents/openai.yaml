@@ -1,0 +1,7 @@
+interface:
+  display_name: "A股共享数据模块"
+  short_description: "A股数据获取共享API和缓存"
+  default_prompt: "Use $a-stock-shared to check A-stock data API status."
+
+policy:
+  allow_implicit_invocation: false
