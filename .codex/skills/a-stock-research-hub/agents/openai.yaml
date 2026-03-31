@@ -1,0 +1,5 @@
+interface:
+  display_name: "A股龙虾投研中枢"
+  short_description: "短线晨报/盘中预警/收盘复盘（带阈值、去重、watchlist）"
+  default_prompt: "Use $a-stock-research-hub to generate a short-term A-stock research report and actionable plan."
+

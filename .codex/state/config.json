@@ -1,0 +1,18 @@
+{
+  "dedup_ttl_sec": 14400,
+  "risk": {
+    "breadth_ratio_weak": 0.5,
+    "breadth_ratio_strong": 1.2,
+    "limit_down_risk": 15,
+    "limit_up_good": 80,
+    "down_gt5_risk": 300
+  },
+  "watchlist": {
+    "max_items": 50,
+    "keywords_max": 50
+  },
+  "report": {
+    "top_theme_n": 8,
+    "top_watch_n": 10
+  }
+}

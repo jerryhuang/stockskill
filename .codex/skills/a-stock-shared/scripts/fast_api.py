@@ -137,7 +137,25 @@ def _get(url: str, timeout: int = 30, retries: int = 3) -> dict:
             last_err = e
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s 退避
-    raise last_err
+    # curl_cffi 偶发被对端直接断开时，回退到 requests 再试一次
+    try:
+        import requests as _req  # type: ignore
+
+        r = _req.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://quote.eastmoney.com/",
+            },
+        )
+        text = r.text
+        if text.startswith("jQuery") or text.startswith("callback"):
+            text = text[text.index("(") + 1: text.rindex(")")]
+        return json.loads(text)
+    except Exception:
+        raise last_err
 
 
 # ═══════════════════════════════════════════════════════════
@@ -310,6 +328,56 @@ def get_stock_individual_fund_flow(code: str) -> pd.DataFrame:
 
     _cache_set(cache_key, rows)
     return pd.DataFrame(rows)
+
+
+def get_board_rank(board_type: str = "industry", top: int = 30) -> pd.DataFrame:
+    """
+    获取行业/概念板块涨跌幅排名（直连东方财富，带缓存）。
+
+    - board_type: "industry" | "concept"
+    - top: 返回前 N 行
+    """
+    board_type = (board_type or "").lower().strip()
+    if board_type not in {"industry", "concept"}:
+        raise ValueError("board_type must be 'industry' or 'concept'")
+
+    cache_key = f"board_rank_{board_type}_{top}"
+    cached = _cache_get(cache_key, CACHE_TTL.get("default", 60))
+    if cached is not None:
+        return pd.DataFrame(cached)
+
+    # 行业板块: m:90+t:2  概念板块: m:90+t:3
+    fs = "m:90+t:2" if board_type == "industry" else "m:90+t:3"
+    url = (
+        "https://push2.eastmoney.com/api/qt/clist/get?"
+        "pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+        "&fltt=2&invt=2&fid=f3"
+        f"&fs={fs}"
+        "&fields=f12,f14,f2,f3,f62,f69,f75"
+        "&_type=json"
+    )
+    data = _get(url)
+    diff = data.get("data", {}).get("diff", []) or []
+
+    rows = []
+    for it in diff[: max(1, min(int(top), 100))]:
+        rows.append(
+            {
+                "代码": it.get("f12", ""),
+                "名称": it.get("f14", ""),
+                "最新价": it.get("f2"),
+                "涨跌幅": it.get("f3"),
+                "主力净额": it.get("f62"),
+                "领涨股": it.get("f69") or it.get("f75") or "",
+            }
+        )
+
+    _cache_set(cache_key, rows)
+    df = pd.DataFrame(rows)
+    for col in ["最新价", "涨跌幅", "主力净额"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def clear_cache():

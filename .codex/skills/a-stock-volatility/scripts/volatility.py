@@ -302,6 +302,69 @@ def get_unusual_stocks():
     print()
 
 
+def get_theme_strength(top: int = 15):
+    """题材强度（基于涨停池聚合：数量 + 连板加权）"""
+    print("=" * 70)
+    print("🧭 题材强度 Top（基于涨停池/连板加权）")
+    print("=" * 70)
+
+    try:
+        zt_df = ak.stock_zt_pool_em(date=pd.Timestamp.now().strftime("%Y%m%d"))
+        if zt_df is None or zt_df.empty:
+            print("  未获取到涨停池数据")
+            print()
+            return
+
+        cols = list(zt_df.columns)
+        streak_col = next((c for c in cols if "连板" in c), None)
+        industry_col = next((c for c in cols if "行业" in c), None)
+        concept_col = next((c for c in cols if "概念" in c or "题材" in c), None)
+
+        # 优先概念，其次行业（不同数据源字段会有差异）
+        theme_col = concept_col or industry_col
+        if not theme_col:
+            print("  题材字段缺失（无概念/行业列）")
+            print()
+            return
+
+        def to_int(x, default=1):
+            try:
+                v = int(x)
+                return v if v > 0 else 1
+            except Exception:
+                return default
+
+        agg = {}
+        for _, row in zt_df.iterrows():
+            theme = str(row.get(theme_col, "")).strip()
+            if not theme or theme == "nan":
+                continue
+            boards = to_int(row.get(streak_col, 1)) if streak_col else 1
+            a = agg.setdefault(theme, {"题材": theme, "涨停数": 0, "连板贡献": 0, "最高板": 1})
+            a["涨停数"] += 1
+            a["连板贡献"] += max(0, boards - 1)
+            a["最高板"] = max(a["最高板"], boards)
+
+        rows = []
+        for v in agg.values():
+            # score 解释：涨停数 + 0.6*连板贡献（短线更看“高度/梯队”但避免过度夸大）
+            score = v["涨停数"] + 0.6 * v["连板贡献"]
+            rows.append(
+                {
+                    "题材": v["题材"],
+                    "score": round(score, 2),
+                    "涨停": v["涨停数"],
+                    "最高板": v["最高板"],
+                }
+            )
+
+        rows.sort(key=lambda x: (x["score"], x["最高板"], x["涨停"]), reverse=True)
+        print(tabulate(rows[: max(1, int(top))], headers="keys", tablefmt="simple", stralign="right"))
+    except Exception as e:
+        print(f"  获取题材强度失败: {e}")
+    print()
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法:")
@@ -311,6 +374,7 @@ def main():
         print("  python volatility.py streak       # 连板股梳理")
         print("  python volatility.py premium      # 涨停溢价率")
         print("  python volatility.py sentiment    # 情绪综合分析")
+        print("  python volatility.py theme        # 题材强度(涨停池聚合)")
         print("  python volatility.py unusual      # 市场异动")
         sys.exit(1)
 
@@ -322,6 +386,7 @@ def main():
         "streak": get_streak_board,
         "premium": get_limit_premium,
         "sentiment": get_sentiment,
+        "theme": get_theme_strength,
         "unusual": get_unusual_stocks,
     }
 
