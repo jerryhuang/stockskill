@@ -69,6 +69,16 @@ def _default_config() -> Dict[str, Any]:
             "top_theme_n": 8,
             "top_watch_n": 10,
         },
+        "news": {
+            "enabled_in_scan": True,
+            "flash_count": 50,
+            "announce_count_per_stock": 8,
+            "keyword_level": {
+                "风险": ["立案", "处罚", "监管处罚", "退市", "终止上市", "ST", "风险提示", "诉讼", "仲裁"],
+                "关注": ["减持", "质押", "解禁", "问询函", "关注函", "延期", "终止", "变更", "亏损"],
+                "信息": ["回购", "增持", "业绩预告", "预增", "中标", "签订", "重大合同", "分红"],
+            },
+        },
     }
 
 
@@ -92,6 +102,21 @@ def ensure_state_files() -> None:
     cfg_path = _config_path()
     if not os.path.exists(cfg_path):
         _save_json(cfg_path, _default_config())
+    else:
+        # 轻量“迁移”：补齐新字段
+        cfg = _load_json(cfg_path, {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        merged = _default_config()
+        # shallow merge
+        for k, v in cfg.items():
+            merged[k] = v
+        # nested merge for news
+        if isinstance(cfg.get("news"), dict):
+            merged_news = _default_config()["news"]
+            merged_news.update(cfg["news"])
+            merged["news"] = merged_news
+        _save_json(cfg_path, merged)
 
     wl_path = _watchlist_path()
     if not os.path.exists(wl_path):
@@ -374,19 +399,19 @@ def scan_alerts() -> None:
         df_spot = _get_all_spot_df()
     except Exception:
         df_spot = None
-    if df_spot is None or df_spot.empty:
-        print("盘中扫描: 无法获取全市场快照（接口波动），本次仅输出空结果")
-        return
 
-    stats = _breadth_stats_from_spot(df_spot)
-    stance, _ = _stance_from_stats(stats, cfg)
+    stats = {}
+    stance = "混沌"
+    if df_spot is not None and not df_spot.empty:
+        stats = _breadth_stats_from_spot(df_spot)
+        stance, _ = _stance_from_stats(stats, cfg)
 
     alerts: List[Tuple[str, str, str]] = []  # (level, title, detail)
     r = cfg["risk"]
 
     # Compare with last snapshot (detect expansion/repair)
     last_stats = last.get("stats") if isinstance(last, dict) else None
-    if isinstance(last_stats, dict) and last_stats:
+    if stats and isinstance(last_stats, dict) and last_stats:
         try:
             ld_delta = int(stats["limit_down"]) - int(last_stats.get("limit_down", 0))
             lu_delta = int(stats["limit_up"]) - int(last_stats.get("limit_up", 0))
@@ -400,17 +425,18 @@ def scan_alerts() -> None:
         except Exception:
             pass
 
-    # Risk alerts
-    if stats["limit_down"] >= r["limit_down_risk"]:
-        alerts.append(("风险", "跌停扩张", f"跌停={stats['limit_down']}（>= {r['limit_down_risk']}）"))
-    if stats["ratio"] < r["breadth_ratio_weak"]:
-        alerts.append(("关注", "广度偏弱", f"涨跌比={stats['ratio']:.2f}（< {r['breadth_ratio_weak']}）"))
-    if stats["limit_up"] >= r["limit_up_good"] and stats["limit_down"] < r["limit_down_risk"]:
-        alerts.append(("信息", "赚钱效应改善", f"涨停={stats['limit_up']}（>= {r['limit_up_good']}）且跌停={stats['limit_down']}"))
+    # Risk alerts (only when breadth stats available)
+    if stats:
+        if stats["limit_down"] >= r["limit_down_risk"]:
+            alerts.append(("风险", "跌停扩张", f"跌停={stats['limit_down']}（>= {r['limit_down_risk']}）"))
+        if stats["ratio"] < r["breadth_ratio_weak"]:
+            alerts.append(("关注", "广度偏弱", f"涨跌比={stats['ratio']:.2f}（< {r['breadth_ratio_weak']}）"))
+        if stats["limit_up"] >= r["limit_up_good"] and stats["limit_down"] < r["limit_down_risk"]:
+            alerts.append(("信息", "赚钱效应改善", f"涨停={stats['limit_up']}（>= {r['limit_up_good']}）且跌停={stats['limit_down']}"))
 
     # Watchlist stock alerts (simple)
     stocks = [s for s in wl.get("stocks", []) if s and s not in set(wl.get("blacklist", []))]
-    if stocks:
+    if stats and stocks:
         for code in stocks:
             m = df_spot[df_spot["代码"] == code]
             if m.empty:
@@ -428,6 +454,72 @@ def scan_alerts() -> None:
                 alerts.append(("信息", "自选股拉升", f"{code} {name} 涨跌幅={chg:.2f}%"))
             if chg <= -5:
                 alerts.append(("关注", "自选股走弱", f"{code} {name} 涨跌幅={chg:.2f}%"))
+
+    # News / announcements keyword triggers (optional, resilient)
+    try:
+        news_cfg = cfg.get("news", {}) if isinstance(cfg, dict) else {}
+        if news_cfg.get("enabled_in_scan", True):
+            import akshare as ak
+            import pandas as pd
+
+            kw_levels = news_cfg.get("keyword_level", {}) if isinstance(news_cfg.get("keyword_level", {}), dict) else {}
+            # user watchlist keywords also treated as "关注"
+            watch_keywords = [str(x).strip() for x in wl.get("keywords", []) if str(x).strip()]
+
+            def classify(text: str) -> Optional[str]:
+                t = text or ""
+                for lvl in ["风险", "关注", "信息"]:
+                    for kw in kw_levels.get(lvl, []) or []:
+                        if kw and kw in t:
+                            return lvl
+                for kw in watch_keywords:
+                    if kw and kw in t:
+                        return "关注"
+                return None
+
+            # Flash news
+            flash_n = int(news_cfg.get("flash_count", 50))
+            try:
+                fdf = ak.stock_info_global_em()
+                if fdf is not None and not fdf.empty:
+                    for _, row in fdf.head(flash_n).iterrows():
+                        content = ""
+                        tstr = ""
+                        for c in fdf.columns:
+                            lc = str(c).lower()
+                            if "时间" in str(c) or "date" in lc:
+                                tstr = str(row.get(c, ""))[:19]
+                            if "内容" in str(c) or "标题" in str(c) or "title" in lc:
+                                content = str(row.get(c, ""))
+                        lvl = classify(content)
+                        if lvl:
+                            alerts.append((lvl, "快讯命中关键词", f"[{tstr}] {content[:120]}"))
+            except Exception:
+                pass
+
+            # Stock announcements (watchlist)
+            ann_n = int(news_cfg.get("announce_count_per_stock", 8))
+            for code in stocks[: int(cfg.get("watchlist", {}).get("max_items", 50))]:
+                try:
+                    adf = ak.stock_notice_report(symbol=code)
+                    if adf is None or adf.empty:
+                        continue
+                    for _, row in adf.head(ann_n).iterrows():
+                        title = ""
+                        d = ""
+                        for c in adf.columns:
+                            lc = str(c).lower()
+                            if "日期" in str(c) or "时间" in str(c) or "date" in lc:
+                                d = str(row.get(c, ""))[:10]
+                            if "标题" in str(c) or "公告" in str(c) or "title" in lc:
+                                title = str(row.get(c, ""))
+                        lvl = classify(title)
+                        if lvl:
+                            alerts.append((lvl, "自选股公告命中", f"{code} [{d}] {title[:120]}"))
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
     # De-dup and print
     out = []
@@ -447,10 +539,11 @@ def scan_alerts() -> None:
     for level, title, detail in out:
         print(f"- [{level}] {title}: {detail}")
 
-    # Persist latest snapshot for next delta detection
-    last = _load_json(_market_last_path(), {})
-    last.update({"ts": time.time(), "stats": stats, "stance": stance})
-    _save_json(_market_last_path(), last)
+    # Persist latest snapshot for next delta detection (only if stats available)
+    if stats:
+        last = _load_json(_market_last_path(), {})
+        last.update({"ts": time.time(), "stats": stats, "stance": stance})
+        _save_json(_market_last_path(), last)
 
 
 def watchlist_cmd(args: List[str]) -> None:
