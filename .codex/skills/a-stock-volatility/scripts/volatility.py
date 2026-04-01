@@ -334,31 +334,43 @@ def get_theme_strength(top: int = 15):
             except Exception:
                 return default
 
+        import re
+
+        def split_themes(raw: str):
+            text = str(raw or "").strip()
+            if not text or text == "nan":
+                return []
+            return [p.strip() for p in re.split(r"[;,，、/|]+", text) if p.strip()]
+
         agg = {}
         for _, row in zt_df.iterrows():
-            theme = str(row.get(theme_col, "")).strip()
-            if not theme or theme == "nan":
+            themes = split_themes(row.get(theme_col, ""))
+            if not themes:
                 continue
             boards = to_int(row.get(streak_col, 1)) if streak_col else 1
-            a = agg.setdefault(theme, {"题材": theme, "涨停数": 0, "连板贡献": 0, "最高板": 1})
-            a["涨停数"] += 1
-            a["连板贡献"] += max(0, boards - 1)
-            a["最高板"] = max(a["最高板"], boards)
+            for theme in themes:
+                a = agg.setdefault(theme, {"题材": theme, "涨停数": 0, "连板贡献": 0, "最高板": 1, "2板+": 0})
+                a["涨停数"] += 1
+                a["连板贡献"] += max(0, boards - 1)
+                a["最高板"] = max(a["最高板"], boards)
+                if boards >= 2:
+                    a["2板+"] += 1
 
         rows = []
         for v in agg.values():
-            # score 解释：涨停数 + 0.6*连板贡献（短线更看“高度/梯队”但避免过度夸大）
-            score = v["涨停数"] + 0.6 * v["连板贡献"]
+            # score: 单日涨停数 + 连板贡献 + 2板以上持续性
+            score = v["涨停数"] + 0.4 * v["连板贡献"] + 0.8 * v["2板+"]
             rows.append(
                 {
                     "题材": v["题材"],
                     "score": round(score, 2),
                     "涨停": v["涨停数"],
+                    "2板+": v["2板+"],
                     "最高板": v["最高板"],
                 }
             )
 
-        rows.sort(key=lambda x: (x["score"], x["最高板"], x["涨停"]), reverse=True)
+        rows.sort(key=lambda x: (x["score"], x["2板+"], x["最高板"], x["涨停"]), reverse=True)
         print(tabulate(rows[: max(1, int(top))], headers="keys", tablefmt="simple", stralign="right"))
     except Exception as e:
         print(f"  获取题材强度失败: {e}")

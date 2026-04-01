@@ -1,6 +1,13 @@
 {
   "stocks": [
-    "600519"
+    {
+      "code": "600519",
+      "thesis": "示例：只放你愿意拿约两周、自己逻辑清楚的标的",
+      "buy_zone": "",
+      "stop_loss": "",
+      "invalid_if": "",
+      "target_days": 10
+    }
   ],
   "keywords": [
     "回购",

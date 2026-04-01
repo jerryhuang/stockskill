@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -44,7 +45,8 @@ def _load_json(path: str, default: Any) -> Any:
 
 
 def _save_json(path: str, obj: Any) -> None:
-    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
@@ -73,6 +75,8 @@ def _default_config() -> Dict[str, Any]:
             "enabled_in_scan": True,
             "flash_count": 50,
             "announce_count_per_stock": 8,
+            "flash_non_risk_require_watch_keyword": True,
+            "ignore_terms": ["STOXX", "State Street"],
             "keyword_level": {
                 "风险": ["立案", "处罚", "监管处罚", "退市", "终止上市", "ST", "风险提示", "诉讼", "仲裁"],
                 "关注": ["减持", "质押", "解禁", "问询函", "关注函", "延期", "终止", "变更", "亏损"],
@@ -135,7 +139,16 @@ def ensure_state_files() -> None:
         _save_json(
             wl_path,
             {
-                "stocks": ["600519"],
+                "stocks": [
+                    {
+                        "code": "600519",
+                        "thesis": "示例：基本面/景气度/事件驱动逻辑",
+                        "buy_zone": "",
+                        "stop_loss": "",
+                        "invalid_if": "",
+                        "target_days": 10,
+                    }
+                ],
                 "keywords": ["回购", "增持", "业绩预告", "重大合同", "监管", "立案", "减持"],
                 "blacklist": [],
             },
@@ -202,6 +215,62 @@ def _normalize_stock_code(code: str) -> str:
         if code.startswith(p):
             return code[2:]
     return code
+
+
+def _watchlist_entries(wl: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entries = []
+    for item in wl.get("stocks", []) or []:
+        if isinstance(item, dict):
+            code = _normalize_stock_code(str(item.get("code", "")))
+            if code:
+                obj = dict(item)
+                obj["code"] = code
+                entries.append(obj)
+        else:
+            code = _normalize_stock_code(str(item))
+            if code:
+                entries.append({"code": code})
+    return entries
+
+
+def _keyword_match_level(
+    text: str,
+    kw_levels: Dict[str, List[str]],
+    watch_keywords: List[str],
+    ignore_terms: List[str],
+) -> Tuple[Optional[str], Optional[str], bool]:
+    t = text or ""
+    upper_t = t.upper()
+    for term in ignore_terms:
+        if term and term.upper() in upper_t:
+            return None, None, False
+
+    def _contains_st_risk(s: str) -> bool:
+        # 避免把 STOXX 等英文串误判为 ST 风险
+        patterns = [
+            r"\*ST",
+            r"ST[\u4e00-\u9fa5A-Za-z0-9]{1,8}",
+            r"被实施ST",
+            r"ST风险",
+        ]
+        return any(re.search(p, s, re.IGNORECASE) for p in patterns)
+
+    for lvl in ["风险", "关注", "信息"]:
+        for kw in kw_levels.get(lvl, []) or []:
+            if not kw:
+                continue
+            if kw == "ST":
+                if _contains_st_risk(t):
+                    return lvl, kw, False
+                continue
+            if kw in t:
+                return lvl, kw, False
+
+    for kw in watch_keywords:
+        if kw and kw in t:
+            return "关注", kw, True
+
+    return None, None, False
 
 
 def _index_kline_recent(secid: str, n: int = 12) -> Optional[Tuple[str, str, float, float, float]]:
@@ -306,8 +375,7 @@ def swing_advisor_brief() -> None:
 
     wl = _load_json(_watchlist_path(), {"stocks": [], "keywords": [], "blacklist": []})
     bl = set(str(x) for x in (wl.get("blacklist") or []))
-    stocks = [_normalize_stock_code(x) for x in (wl.get("stocks") or []) if x and _normalize_stock_code(x) not in bl]
-    stocks = [x for x in stocks if x][:wl_max]
+    entries = [e for e in _watchlist_entries(wl) if e["code"] not in bl][:wl_max]
 
     print("=" * 72)
     print(f"🦞 A股波段参谋（目标持有约{hold}个交易日）  {_now_str()}")
@@ -345,16 +413,30 @@ def swing_advisor_brief() -> None:
         print("- 上证日线序列暂不可用")
 
     print("\n【自选体检（收盘 vs MA，仅技术位）】")
-    if not stocks:
+    if not entries:
         print("- watchlist 无股票。请执行: `hub.py watchlist add-stock 你的代码`")
     else:
-        for c in stocks:
+        for entry in entries:
+            c = entry["code"]
             row = _swing_stock_row(c, ma_w)
             if row:
                 print(
                     f"- {row['代码']}: 收盘 {row['收盘']}  {row[f'MA{ma_w}']}  "
                     f"{row['vsMA']}{ma_w}  近5日 {row['近5日%']}%"
                 )
+                plan_bits = []
+                if entry.get("buy_zone"):
+                    plan_bits.append(f"买入区间={entry['buy_zone']}")
+                if entry.get("stop_loss"):
+                    plan_bits.append(f"止损={entry['stop_loss']}")
+                if entry.get("invalid_if"):
+                    plan_bits.append(f"失效条件={entry['invalid_if']}")
+                if entry.get("target_days"):
+                    plan_bits.append(f"目标持有={entry['target_days']}天")
+                if entry.get("thesis"):
+                    plan_bits.append(f"逻辑={entry['thesis']}")
+                if plan_bits:
+                    print(f"  计划: {' | '.join(plan_bits)}")
             else:
                 print(f"- {c}: 数据暂不可用")
 
@@ -398,22 +480,40 @@ def _themes_from_zt_pool(df, top_n: int = 8) -> List[Dict[str, Any]]:
         except Exception:
             return 1
 
+    def _split_themes(raw: str) -> List[str]:
+        text = str(raw or "").strip()
+        if not text or text == "nan":
+            return []
+        parts = re.split(r"[;,，、/|]+", text)
+        return [p.strip() for p in parts if p.strip()]
+
     agg: Dict[str, Dict[str, Any]] = {}
     for _, row in df.iterrows():
-        theme = str(row.get(theme_col, "")).strip()
-        if not theme or theme == "nan":
+        themes = _split_themes(row.get(theme_col, ""))
+        if not themes:
             continue
         boards = _streak_val(row.get(streak_col, 1)) if streak_col else 1
-        a = agg.setdefault(theme, {"theme": theme, "count": 0, "boards_sum": 0, "max_boards": 1})
-        a["count"] += 1
-        a["boards_sum"] += boards
-        a["max_boards"] = max(a["max_boards"], boards)
+        for theme in themes:
+            a = agg.setdefault(
+                theme,
+                {"theme": theme, "count": 0, "boards_sum": 0, "max_boards": 1, "multi_boards": 0},
+            )
+            a["count"] += 1
+            a["boards_sum"] += boards
+            a["max_boards"] = max(a["max_boards"], boards)
+            if boards >= 2:
+                a["multi_boards"] += 1
 
     items = list(agg.values())
-    # score: 数量 + (连板贡献)
+    # score: 数量 + 连板贡献 + 2板以上持续性
     for it in items:
-        it["score"] = round(it["count"] + 0.6 * max(0, it["boards_sum"] - it["count"]), 2)
-    items.sort(key=lambda x: (x["score"], x["max_boards"], x["count"]), reverse=True)
+        it["score"] = round(
+            it["count"]
+            + 0.4 * max(0, it["boards_sum"] - it["count"])
+            + 0.8 * it["multi_boards"],
+            2,
+        )
+    items.sort(key=lambda x: (x["score"], x["multi_boards"], x["max_boards"], x["count"]), reverse=True)
     return items[:top_n]
 
 
@@ -544,7 +644,10 @@ def close_report() -> None:
     print("\n题材（基于涨停池聚合）")
     if themes:
         for it in themes:
-            print(f"- {it['theme']}: score={it['score']}  涨停={it['count']}  最高连板={it['max_boards']}")
+            print(
+                f"- {it['theme']}: score={it['score']}  涨停={it['count']}  "
+                f"2板+={it['multi_boards']}  最高连板={it['max_boards']}"
+            )
     else:
         print("- 无法获取涨停池/题材数据（可能非交易时段或接口波动）")
 
@@ -614,7 +717,9 @@ def scan_alerts() -> None:
             alerts.append(("信息", "赚钱效应改善", f"涨停={stats['limit_up']}（>= {r['limit_up_good']}）且跌停={stats['limit_down']}"))
 
     # Watchlist stock alerts (simple)
-    stocks = [s for s in wl.get("stocks", []) if s and s not in set(wl.get("blacklist", []))]
+    entries = _watchlist_entries(wl)
+    blacklist = set(str(x) for x in (wl.get("blacklist") or []))
+    stocks = [e["code"] for e in entries if e["code"] not in blacklist]
     if stats and stocks:
         for code in stocks:
             m = df_spot[df_spot["代码"] == code]
@@ -639,22 +744,11 @@ def scan_alerts() -> None:
         news_cfg = cfg.get("news", {}) if isinstance(cfg, dict) else {}
         if news_cfg.get("enabled_in_scan", True):
             import akshare as ak
-            import pandas as pd
 
             kw_levels = news_cfg.get("keyword_level", {}) if isinstance(news_cfg.get("keyword_level", {}), dict) else {}
-            # user watchlist keywords also treated as "关注"
             watch_keywords = [str(x).strip() for x in wl.get("keywords", []) if str(x).strip()]
-
-            def classify(text: str) -> Optional[str]:
-                t = text or ""
-                for lvl in ["风险", "关注", "信息"]:
-                    for kw in kw_levels.get(lvl, []) or []:
-                        if kw and kw in t:
-                            return lvl
-                for kw in watch_keywords:
-                    if kw and kw in t:
-                        return "关注"
-                return None
+            ignore_terms = [str(x).strip() for x in news_cfg.get("ignore_terms", []) if str(x).strip()]
+            flash_non_risk_require_watch_keyword = bool(news_cfg.get("flash_non_risk_require_watch_keyword", True))
 
             # Flash news
             flash_n = int(news_cfg.get("flash_count", 50))
@@ -670,9 +764,11 @@ def scan_alerts() -> None:
                                 tstr = str(row.get(c, ""))[:19]
                             if "内容" in str(c) or "标题" in str(c) or "title" in lc:
                                 content = str(row.get(c, ""))
-                        lvl = classify(content)
+                        lvl, hit_kw, is_watch_kw = _keyword_match_level(content, kw_levels, watch_keywords, ignore_terms)
                         if lvl:
-                            alerts.append((lvl, "快讯命中关键词", f"[{tstr}] {content[:120]}"))
+                            if flash_non_risk_require_watch_keyword and lvl != "风险" and not is_watch_kw:
+                                continue
+                            alerts.append((lvl, "快讯命中关键词", f"[{tstr}] [{hit_kw}] {content[:120]}"))
             except Exception:
                 pass
 
@@ -692,9 +788,9 @@ def scan_alerts() -> None:
                                 d = str(row.get(c, ""))[:10]
                             if "标题" in str(c) or "公告" in str(c) or "title" in lc:
                                 title = str(row.get(c, ""))
-                        lvl = classify(title)
+                        lvl, hit_kw, _ = _keyword_match_level(title, kw_levels, watch_keywords, ignore_terms)
                         if lvl:
-                            alerts.append((lvl, "自选股公告命中", f"{code} [{d}] {title[:120]}"))
+                            alerts.append((lvl, "自选股公告命中", f"{code} [{d}] [{hit_kw}] {title[:120]}"))
                 except Exception:
                     continue
     except Exception:
@@ -736,17 +832,92 @@ def watchlist_cmd(args: List[str]) -> None:
         print(json.dumps(wl, ensure_ascii=False, indent=2))
         return
 
+    if args[0] == "template":
+        print(
+            json.dumps(
+                {
+                    "stocks": [
+                        {
+                            "code": "600519",
+                            "thesis": "为什么买它",
+                            "buy_zone": "参考买入区间",
+                            "stop_loss": "止损位/条件",
+                            "invalid_if": "逻辑何时失效",
+                            "target_days": 10,
+                        }
+                    ],
+                    "keywords": ["回购", "增持"],
+                    "blacklist": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
     cmd = args[0]
     if cmd == "add-stock" and len(args) >= 2:
         code = args[1].strip()
-        if code and code not in wl["stocks"]:
-            wl["stocks"].append(code)
+        norm = _normalize_stock_code(code)
+        entries = _watchlist_entries(wl)
+        if norm and all(e["code"] != norm for e in entries):
+            wl["stocks"].append(
+                {
+                    "code": norm,
+                    "thesis": "",
+                    "buy_zone": "",
+                    "stop_loss": "",
+                    "invalid_if": "",
+                    "target_days": 10,
+                }
+            )
             _save()
         print("OK")
         return
     if cmd == "rm-stock" and len(args) >= 2:
-        code = args[1].strip()
-        wl["stocks"] = [x for x in wl["stocks"] if x != code]
+        code = _normalize_stock_code(args[1].strip())
+        kept = []
+        for item in wl["stocks"]:
+            if isinstance(item, dict):
+                if _normalize_stock_code(str(item.get("code", ""))) != code:
+                    kept.append(item)
+            else:
+                if _normalize_stock_code(str(item)) != code:
+                    kept.append(item)
+        wl["stocks"] = kept
+        _save()
+        print("OK")
+        return
+    if cmd == "set-field" and len(args) >= 4:
+        code = _normalize_stock_code(args[1].strip())
+        field = args[2].strip()
+        value = " ".join(args[3:]).strip()
+        allowed = {"thesis", "buy_zone", "stop_loss", "invalid_if", "target_days"}
+        if field not in allowed:
+            print(f"不支持字段: {field}，可用: {', '.join(sorted(allowed))}")
+            sys.exit(1)
+        changed = False
+        new_items = []
+        for item in wl["stocks"]:
+            if isinstance(item, dict):
+                obj = dict(item)
+            else:
+                obj = {
+                    "code": _normalize_stock_code(str(item)),
+                    "thesis": "",
+                    "buy_zone": "",
+                    "stop_loss": "",
+                    "invalid_if": "",
+                    "target_days": 10,
+                }
+            if obj.get("code") == code:
+                obj[field] = int(value) if field == "target_days" and value.isdigit() else value
+                changed = True
+            new_items.append(obj)
+        if not changed:
+            print(f"未找到股票: {code}")
+            sys.exit(1)
+        wl["stocks"] = new_items
         _save()
         print("OK")
         return
@@ -764,7 +935,7 @@ def watchlist_cmd(args: List[str]) -> None:
         print("OK")
         return
 
-    print("未知 watchlist 命令。可用: show, add-stock, rm-stock, add-keyword, rm-keyword")
+    print("未知 watchlist 命令。可用: show, template, add-stock, rm-stock, set-field, add-keyword, rm-keyword")
     sys.exit(1)
 
 
@@ -776,7 +947,7 @@ def main():
         print("  python hub.py scan")
         print("  python hub.py close")
         print("  python hub.py swing      # 波段(~2周)参谋简报")
-        print("  python hub.py watchlist [show|add-stock|rm-stock|add-keyword|rm-keyword] ...")
+        print("  python hub.py watchlist [show|template|add-stock|rm-stock|set-field|add-keyword|rm-keyword] ...")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()

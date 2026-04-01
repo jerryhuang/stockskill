@@ -87,6 +87,25 @@ def _cache_get(key: str, ttl: int):
     return None
 
 
+def _cache_get_any(key: str):
+    """读取缓存，不校验 TTL；用于网络异常时回退到最近一次完整数据。"""
+    with _mem_lock:
+        if key in _mem_cache:
+            return _mem_cache[key][1]
+
+    cache_file = os.path.join(_CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                data = json.load(f)
+            with _mem_lock:
+                _mem_cache[key] = (time.time(), data)
+            return data
+        except Exception:
+            pass
+    return None
+
+
 def _cache_set(key: str, data):
     """同时写入内存和文件缓存"""
     with _mem_lock:
@@ -194,28 +213,51 @@ def get_all_a_stock_spot() -> pd.DataFrame:
         f"pn=1&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3"
         f"&fields={fields}&fs={fs}&_type=json"
     )
-    data = _get(first_url)
-    total = data.get("data", {}).get("total", 0)
-    first_page = data.get("data", {}).get("diff", [])
+    try:
+        data = _get(first_url)
+        total = data.get("data", {}).get("total", 0)
+        first_page = data.get("data", {}).get("diff", [])
 
-    if total == 0:
-        return pd.DataFrame()
+        if total == 0:
+            return pd.DataFrame()
 
-    total_pages = (total + 99) // 100
-    all_items = list(first_page)
+        total_pages = (total + 99) // 100
+        all_items = list(first_page)
 
-    if total_pages > 1:
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {
-                executor.submit(_fetch_page, pn, fields, fs): pn
-                for pn in range(2, total_pages + 1)
-            }
-            for future in as_completed(futures):
-                items = future.result()
-                all_items.extend(items)
+        if total_pages > 1:
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                futures = {
+                    executor.submit(_fetch_page, pn, fields, fs): pn
+                    for pn in range(2, total_pages + 1)
+                }
+                for future in as_completed(futures):
+                    items = future.result()
+                    all_items.extend(items)
 
-    _cache_set(cache_key, all_items)
-    return _items_to_df(all_items)
+        # 去重并校验完整性：分页缺失时不要把残缺快照当成真实全市场
+        dedup = {}
+        for item in all_items:
+            code = item.get("f12", "")
+            if code:
+                dedup[code] = item
+        dedup_items = list(dedup.values())
+
+        min_expected = int(total * 0.95)
+        if len(dedup_items) < min_expected:
+            stale = _cache_get_any(cache_key)
+            if stale:
+                return _items_to_df(stale)
+            raise RuntimeError(
+                f"incomplete market snapshot: expected≈{total}, got={len(dedup_items)}"
+            )
+
+        _cache_set(cache_key, dedup_items)
+        return _items_to_df(dedup_items)
+    except Exception:
+        stale = _cache_get_any(cache_key)
+        if stale:
+            return _items_to_df(stale)
+        raise
 
 
 def _items_to_df(items: list) -> pd.DataFrame:

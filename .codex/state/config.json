@@ -19,6 +19,11 @@
     "enabled_in_scan": true,
     "flash_count": 50,
     "announce_count_per_stock": 8,
+    "flash_non_risk_require_watch_keyword": true,
+    "ignore_terms": [
+      "STOXX",
+      "State Street"
+    ],
     "keyword_level": {
       "风险": [
         "立案",
