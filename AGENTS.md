@@ -21,6 +21,7 @@ pip install akshare pandas tabulate curl_cffi numpy
 | a-stock-capital-flow | 资金流向、北向资金、板块资金 | 资金流向、主力、北向资金 |
 | a-stock-news | 财经快讯、公告、新闻日历 | 新闻、快讯、公告、财经日历 |
 | a-stock-volatility | 涨跌停统计、市场情绪、异动 | 涨停、跌停、炸板、情绪、异动 |
+| a-stock-research-hub | 投研编排：短线晨报/scan/复盘；波段 swing 参谋 | 复盘、晨报、没时间看盘、两周持有、军师 |
 | a-stock-shared | 共享数据模块（被其他 skill 依赖） | 不直接调用 |
 
 ## 注意事项

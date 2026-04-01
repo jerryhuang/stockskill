@@ -1,9 +1,9 @@
 ---
 name: a-stock-research-hub
-description: 面向短线交易的A股投研编排中枢。会综合指数/广度/涨跌停/连板/新闻公告与自选股，生成晨报、盘中预警、收盘复盘，并给出明确可执行的观察清单与风控失效条件。当用户问“今天怎么做、盘中异动、复盘、晨报、自选股是否触发信号、题材主线/退潮”等时使用。
+description: A股投研编排中枢。短线：晨报、盘中 scan（新闻/公告关键词+情绪）、收盘复盘；波段（约两周少看盘）：swing 参谋简报（指数环境+自选 MA 位）。当用户问「今天怎么做、复盘、晨报、波段持有两周、没时间看盘、军师参谋」或要结构化风控清单时使用。
 ---
 
-# A股龙虾投研中枢（短线）
+# A股龙虾投研中枢
 
 ## 依赖
 
@@ -15,23 +15,35 @@ pip install akshare pandas tabulate curl_cffi numpy
 
 ## 命令
 
-### 晨报（开盘前）
+### 短线 · 晨报（开盘前）
 
 ```bash
 python .codex/skills/a-stock-research-hub/scripts/hub.py morning
 ```
 
-### 盘中预警（事件扫描）
+### 短线 · 盘中预警（事件扫描，含快讯/公告关键词）
 
 ```bash
 python .codex/skills/a-stock-research-hub/scripts/hub.py scan
 ```
 
-### 收盘复盘（收盘后）
+### 短线 · 收盘复盘
 
 ```bash
 python .codex/skills/a-stock-research-hub/scripts/hub.py close
 ```
+
+### 波段（约两周，少看盘）· 参谋简报
+
+适合**已选好标的、持有约 10 个交易日**、每周只看 1～2 次盘面的用法：
+
+```bash
+python .codex/skills/a-stock-research-hub/scripts/hub.py swing
+```
+
+输出包含：节奏建议、指数环境、上证近段走势、自选相对 MA20 与近 5 日涨跌幅（**不构成荐股**，仅技术位体检）。
+
+波段参数可在 `.codex/state/config.json` 的 `swing` 段调整：`hold_days_target`、`review_per_week`、`ma_window`、`watchlist_snapshot_max`。
 
 ### 管理自选与关键词
 
@@ -39,13 +51,16 @@ python .codex/skills/a-stock-research-hub/scripts/hub.py close
 python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist show
 python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist add-stock 600519
 python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist add-keyword 回购
-python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist rm-stock 600519
-python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist rm-keyword 回购
 ```
 
-## 输出规范（固定四段）
-- **TL;DR**：一句话给结论（进攻/防守/混沌）\n
-- **证据**：触发阈值的数据点\n
-- **行动**：明确到“仓位/观察/试错/回避”\n
-- **风险**：失效条件（例如跌停扩张、连板断板、广度转弱）\n
+## 输出规范（固定四段，晨报/复盘）
 
+- **TL;DR**：一句话结论（进攻/防守/混沌或波段环境）
+- **证据**：数据点
+- **行动**：观察/试错/减仓/回避
+- **风险**：失效条件
+
+## 注意事项
+
+- 数据来自公开接口，仅供参考，**不构成投资建议**
+- 全市场快照偶发失败时，部分广度指标会降级或跳过

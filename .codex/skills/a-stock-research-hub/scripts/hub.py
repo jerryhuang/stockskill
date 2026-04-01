@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-短线投研编排中枢（云端可跑）：
-- 生成晨报/盘中扫描/收盘复盘
-- watchlist + 新闻关键词触发
-- 告警去重（TTL）
+投研编排中枢（云端可跑）：
+- 短线：晨报 / 盘中扫描 / 收盘复盘
+- 波段（约两周）：swing 参谋简报（少看盘节奏 + 指数近况 + 自选 MA 位置）
+- watchlist + 新闻/公告关键词触发；告警去重（TTL）
 """
 
 from __future__ import annotations
@@ -79,6 +79,14 @@ def _default_config() -> Dict[str, Any]:
                 "信息": ["回购", "增持", "业绩预告", "预增", "中标", "签订", "重大合同", "分红"],
             },
         },
+        # 波段持有（约 10 个交易日 / 2 周）：偏低频决策，配套「参谋」输出
+        "swing": {
+            "hold_days_target": 10,
+            "review_per_week": 2,
+            "ma_window": 20,
+            "watchlist_snapshot_max": 10,
+            "index_kline_days": 12,
+        },
     }
 
 
@@ -116,6 +124,10 @@ def ensure_state_files() -> None:
             merged_news = _default_config()["news"]
             merged_news.update(cfg["news"])
             merged["news"] = merged_news
+        if isinstance(cfg.get("swing"), dict):
+            merged_swing = _default_config()["swing"]
+            merged_swing.update(cfg["swing"])
+            merged["swing"] = merged_swing
         _save_json(cfg_path, merged)
 
     wl_path = _watchlist_path()
@@ -182,6 +194,173 @@ def _index_quotes_df():
     from fast_api import get_index_quotes
 
     return get_index_quotes()
+
+
+def _normalize_stock_code(code: str) -> str:
+    code = (code or "").strip()
+    for p in ("sh", "sz", "bj", "SH", "SZ", "BJ"):
+        if code.startswith(p):
+            return code[2:]
+    return code
+
+
+def _index_kline_recent(secid: str, n: int = 12) -> Optional[Tuple[str, str, float, float, float]]:
+    """返回 (起始日, 结束日, 区间涨跌%, 区间振幅%, 最新收盘) 或 None。"""
+    params = {
+        "secid": secid,
+        "klt": "101",
+        "fqt": "1",
+        "lmt": str(max(5, min(int(n), 30))),
+        "end": "20500101",
+        "beg": "0",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    j = None
+    try:
+        from curl_cffi import requests as curlreq
+
+        r = curlreq.get(url, params=params, timeout=30, impersonate="chrome110")
+        j = r.json()
+    except Exception:
+        try:
+            import requests as _rq
+
+            r = _rq.get(
+                url,
+                params=params,
+                timeout=30,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Referer": "https://quote.eastmoney.com/",
+                },
+            )
+            j = r.json()
+        except Exception:
+            return None
+
+    try:
+        kl = (j or {}).get("data", {}).get("klines", [])
+        if not kl:
+            return None
+        take = max(5, min(int(n), 30))
+        kl = kl[-take:]
+        rows = []
+        for s in kl:
+            parts = s.split(",")
+            if len(parts) >= 5:
+                d, _o, c, h, low = parts[0], parts[1], parts[2], parts[3], parts[4]
+                rows.append((d, float(c), float(h), float(low)))
+        if not rows:
+            return None
+        start_d, start_c, _, _ = rows[0]
+        end_d, end_c, hi, lo = rows[-1][0], rows[-1][1], max(r[2] for r in rows), min(r[3] for r in rows)
+        chg = (end_c - start_c) / start_c * 100 if start_c else 0.0
+        amp = (hi - lo) / start_c * 100 if start_c else 0.0
+        return start_d, end_d, round(chg, 2), round(amp, 2), end_c
+    except Exception:
+        return None
+
+
+def _swing_stock_row(code: str, ma_w: int) -> Optional[Dict[str, Any]]:
+    import akshare as ak
+
+    code = _normalize_stock_code(code)
+    if not code or not code.isdigit():
+        return None
+    try:
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+        if df is None or df.empty or len(df) < ma_w + 2:
+            return None
+        close_col = next((c for c in df.columns if "收盘" in str(c)), None)
+        if not close_col:
+            return None
+        s = df[close_col].astype(float)
+        last = float(s.iloc[-1])
+        ma = float(s.tail(ma_w).mean())
+        base5 = float(s.iloc[-6]) if len(s) >= 6 else float(s.iloc[0])
+        ret5 = (last / base5 - 1) * 100 if base5 else 0.0
+        pos = "站上MA" if last >= ma else "跌破MA"
+        return {
+            "代码": code,
+            "收盘": round(last, 2),
+            f"MA{ma_w}": round(ma, 2),
+            "vsMA": pos,
+            "近5日%": round(ret5, 2),
+        }
+    except Exception:
+        return None
+
+
+def swing_advisor_brief() -> None:
+    """波段（约两周）参谋简报：低频节奏 + 环境 + 自选技术位（非荐股）。"""
+    ensure_state_files()
+    cfg = _load_json(_config_path(), _default_config())
+    sw = cfg.get("swing", {}) if isinstance(cfg.get("swing"), dict) else {}
+    hold = int(sw.get("hold_days_target", 10))
+    reviews = int(sw.get("review_per_week", 2))
+    ma_w = int(sw.get("ma_window", 20))
+    wl_max = int(sw.get("watchlist_snapshot_max", 10))
+    kdays = int(sw.get("index_kline_days", 12))
+
+    wl = _load_json(_watchlist_path(), {"stocks": [], "keywords": [], "blacklist": []})
+    bl = set(str(x) for x in (wl.get("blacklist") or []))
+    stocks = [_normalize_stock_code(x) for x in (wl.get("stocks") or []) if x and _normalize_stock_code(x) not in bl]
+    stocks = [x for x in stocks if x][:wl_max]
+
+    print("=" * 72)
+    print(f"🦞 A股波段参谋（目标持有约{hold}个交易日）  {_now_str()}")
+    print("=" * 72)
+
+    print("\n【军师角色说明】")
+    print("- 目标：少看盘、2 周左右决策节奏；输出为**环境与自选体检**，不代替你下单。")
+    print("- 你只需自选里放**已经研究过、愿意拿 2 周**的标的；参谋帮你盯**指数+技术位+公告关键词**。")
+    print(f"- 建议节奏：每周主动看 **{reviews}** 次本简报 + 收盘后跑一次 `hub.py close`；异动时跑 `hub.py scan`。")
+
+    print("\n【买入/卖出纪律模板（请自己填具体价位）】")
+    print("- 买入：只在**指数环境不过度恶化**、且个股**逻辑未破坏**时分批；单票仓位上限自行定。")
+    print("- 卖出三类触发（缺一不可地写在纸上）：①触及止损价 ②持有满/到 2 周仍无表现且走弱 ③逻辑或公告证伪")
+
+    print("\n【环境：主要指数快照】")
+    try:
+        idx = _index_quotes_df()
+        if idx is not None and not idx.empty:
+            for name in ["上证指数", "深证成指", "创业板指", "科创50", "沪深300", "中证1000"]:
+                sub = idx[idx["指数"] == name]
+                if not sub.empty:
+                    r = sub.iloc[0]
+                    print(f"- {name}: {float(r['最新价']):.2f}  ({float(r['涨跌幅']):.2f}%)")
+        else:
+            print("- 暂无法获取指数快照")
+    except Exception as e:
+        print(f"- 指数快照不可用: {e}")
+
+    print("\n【环境：上证近段走势（约{}根日K）】".format(kdays))
+    k = _index_kline_recent("1.000001", n=kdays)
+    if k:
+        a, b, chg, amp, cls = k
+        print(f"- 区间 {a} ~ {b}  上证收盘约 {cls:.2f}  区间涨跌 {chg}%  振幅 {amp}%")
+    else:
+        print("- 上证日线序列暂不可用")
+
+    print("\n【自选体检（收盘 vs MA，仅技术位）】")
+    if not stocks:
+        print("- watchlist 无股票。请执行: `hub.py watchlist add-stock 你的代码`")
+    else:
+        for c in stocks:
+            row = _swing_stock_row(c, ma_w)
+            if row:
+                print(
+                    f"- {row['代码']}: 收盘 {row['收盘']}  {row[f'MA{ma_w}']}  "
+                    f"{row['vsMA']}{ma_w}  近5日 {row['近5日%']}%"
+                )
+            else:
+                print(f"- {c}: 数据暂不可用")
+
+    print("\n【风险】")
+    print("- 数据源波动时部分内容会缺失；重大事件以交易所公告为准。")
+    print("- 以上内容仅供复盘与风控，不构成投资建议。\n")
 
 
 def _fetch_zt_pool_df() -> Optional["Any"]:
@@ -596,6 +775,7 @@ def main():
         print("  python hub.py morning")
         print("  python hub.py scan")
         print("  python hub.py close")
+        print("  python hub.py swing      # 波段(~2周)参谋简报")
         print("  python hub.py watchlist [show|add-stock|rm-stock|add-keyword|rm-keyword] ...")
         sys.exit(1)
 
@@ -606,6 +786,8 @@ def main():
         scan_alerts()
     elif cmd == "close":
         close_report()
+    elif cmd == "swing":
+        swing_advisor_brief()
     elif cmd == "watchlist":
         watchlist_cmd(sys.argv[2:])
     else:

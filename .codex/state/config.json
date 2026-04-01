@@ -53,5 +53,12 @@
         "分红"
       ]
     }
+  },
+  "swing": {
+    "hold_days_target": 10,
+    "review_per_week": 2,
+    "ma_window": 20,
+    "watchlist_snapshot_max": 10,
+    "index_kline_days": 12
   }
 }
