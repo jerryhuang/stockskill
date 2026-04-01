@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -91,6 +91,11 @@ def _default_config() -> Dict[str, Any]:
             "watchlist_snapshot_max": 10,
             "index_kline_days": 12,
         },
+        "nightly": {
+            "enabled": True,
+            "focus_watch_max": 8,
+            "save_markdown": True,
+        },
     }
 
 
@@ -132,6 +137,10 @@ def ensure_state_files() -> None:
             merged_swing = _default_config()["swing"]
             merged_swing.update(cfg["swing"])
             merged["swing"] = merged_swing
+        if isinstance(cfg.get("nightly"), dict):
+            merged_nightly = _default_config()["nightly"]
+            merged_nightly.update(cfg["nightly"])
+            merged["nightly"] = merged_nightly
         _save_json(cfg_path, merged)
 
     wl_path = _watchlist_path()
@@ -147,6 +156,11 @@ def ensure_state_files() -> None:
                         "stop_loss": "",
                         "invalid_if": "",
                         "target_days": 10,
+                        "opened_on": "",
+                        "cost_basis": "",
+                        "position_pct": "",
+                        "status": "watch",
+                        "notes": "",
                     }
                 ],
                 "keywords": ["回购", "增持", "业绩预告", "重大合同", "监管", "立案", "减持"],
@@ -229,8 +243,44 @@ def _watchlist_entries(wl: Dict[str, Any]) -> List[Dict[str, Any]]:
         else:
             code = _normalize_stock_code(str(item))
             if code:
-                entries.append({"code": code})
+                entries.append(
+                    {
+                        "code": code,
+                        "thesis": "",
+                        "buy_zone": "",
+                        "stop_loss": "",
+                        "invalid_if": "",
+                        "target_days": 10,
+                        "opened_on": "",
+                        "cost_basis": "",
+                        "position_pct": "",
+                        "status": "watch",
+                        "notes": "",
+                    }
+                )
     return entries
+
+
+def _safe_float(val: Any) -> Optional[float]:
+    try:
+        text = str(val).strip()
+        if not text:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _parse_date(val: Any) -> Optional[date]:
+    text = str(val or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except Exception:
+            pass
+    return None
 
 
 def _keyword_match_level(
@@ -357,9 +407,58 @@ def _swing_stock_row(code: str, ma_w: int) -> Optional[Dict[str, Any]]:
             f"MA{ma_w}": round(ma, 2),
             "vsMA": pos,
             "近5日%": round(ret5, 2),
+            "距MA%": round((last / ma - 1) * 100, 2) if ma else 0.0,
         }
     except Exception:
         return None
+
+
+def _evaluate_watch_entry(entry: Dict[str, Any], row: Optional[Dict[str, Any]], default_hold_days: int) -> Dict[str, Any]:
+    result = {"code": entry.get("code", ""), "signal": "观察", "reason": []}
+    if row is None:
+        result["signal"] = "数据缺失"
+        result["reason"].append("无法拉取K线/均线")
+        return result
+
+    stop_loss = _safe_float(entry.get("stop_loss"))
+    cost_basis = _safe_float(entry.get("cost_basis"))
+    target_days = int(entry.get("target_days") or default_hold_days)
+    opened_on = _parse_date(entry.get("opened_on"))
+    last = float(row["收盘"])
+    dist_ma = float(row.get("距MA%", 0))
+    ret5 = float(row.get("近5日%", 0))
+
+    risk = False
+    if stop_loss is not None and last <= stop_loss:
+        risk = True
+        result["reason"].append(f"跌破止损({stop_loss})")
+    if row["vsMA"].startswith("跌破"):
+        result["reason"].append("跌破MA")
+    if dist_ma <= -2:
+        risk = True
+        result["reason"].append(f"弱于MA较多({dist_ma}%)")
+    if ret5 <= -5:
+        risk = True
+        result["reason"].append(f"近5日走弱({ret5}%)")
+
+    if opened_on:
+        held = (date.today() - opened_on).days
+        result["held_days"] = held
+        if held >= target_days and ret5 <= 0:
+            result["reason"].append(f"达到目标持有天数({held}/{target_days})且无明显表现")
+    if cost_basis is not None and cost_basis:
+        result["pnl_pct"] = round((last / cost_basis - 1) * 100, 2)
+
+    if risk:
+        result["signal"] = "警惕"
+    elif ret5 >= 3 and dist_ma >= 0:
+        result["signal"] = "可继续跟踪"
+        result["reason"].append("强于MA且近5日有表现")
+    else:
+        result["signal"] = "观察"
+        if not result["reason"]:
+            result["reason"].append("未见明显强化/失效")
+    return result
 
 
 def swing_advisor_brief() -> None:
@@ -437,12 +536,117 @@ def swing_advisor_brief() -> None:
                     plan_bits.append(f"逻辑={entry['thesis']}")
                 if plan_bits:
                     print(f"  计划: {' | '.join(plan_bits)}")
+                eval_result = _evaluate_watch_entry(entry, row, hold)
+                extra = ""
+                if "pnl_pct" in eval_result:
+                    extra = f" | 浮动={eval_result['pnl_pct']}%"
+                print(f"  参谋: {eval_result['signal']} | {'；'.join(eval_result['reason'])}{extra}")
             else:
                 print(f"- {c}: 数据暂不可用")
 
     print("\n【风险】")
     print("- 数据源波动时部分内容会缺失；重大事件以交易所公告为准。")
     print("- 以上内容仅供复盘与风控，不构成投资建议。\n")
+
+
+def nightly_advisor_brief() -> None:
+    """适合定时任务的晚间参谋简报：收盘环境 + 主线 + 自选计划检查。"""
+    ensure_state_files()
+    cfg = _load_json(_config_path(), _default_config())
+    sw = cfg.get("swing", {})
+    nightly = cfg.get("nightly", {})
+    hold = int(sw.get("hold_days_target", 10))
+    ma_w = int(sw.get("ma_window", 20))
+    wl_max = int(nightly.get("focus_watch_max", 8))
+
+    wl = _load_json(_watchlist_path(), {"stocks": [], "keywords": [], "blacklist": []})
+    blacklist = set(str(x) for x in (wl.get("blacklist") or []))
+    entries = [e for e in _watchlist_entries(wl) if e["code"] not in blacklist][:wl_max]
+
+    try:
+        df_spot = _get_all_spot_df()
+        stats = _breadth_stats_from_spot(df_spot) if df_spot is not None and not df_spot.empty else {}
+    except Exception:
+        stats = {}
+    idx_df = _index_quotes_df()
+    zt_df = _fetch_zt_pool_df()
+    themes = _themes_from_zt_pool(zt_df, top_n=int(cfg["report"]["top_theme_n"]))
+    stance, stance_note = _stance_from_stats(stats, cfg) if stats else ("混沌", "广度/涨跌停数据不足，先以防守心态")
+
+    lines: List[str] = []
+    lines.append(f"# 晚间参谋简报 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append(f"- 环境：**{stance}**。{stance_note}")
+    if idx_df is not None and not idx_df.empty:
+        focus = ["上证指数", "创业板指", "科创50", "沪深300", "中证1000"]
+        idx_bits = []
+        for name in focus:
+            sub = idx_df[idx_df["指数"] == name]
+            if not sub.empty:
+                r = sub.iloc[0]
+                idx_bits.append(f"{name} {float(r['涨跌幅']):.2f}%")
+        if idx_bits:
+            lines.append(f"- 指数：{' | '.join(idx_bits)}")
+
+    lines.append("")
+    lines.append("## 证据")
+    if stats:
+        lines.append(f"- 广度：上涨{stats['up']} / 下跌{stats['down']}，涨跌比 {stats['ratio']:.2f}，市场均涨幅 {stats['mean_pct']:.2f}%")
+        lines.append(f"- 情绪：涨停{stats['limit_up']} / 跌停{stats['limit_down']}，涨幅>5% {stats['up_gt5']}，跌幅>5% {stats['down_gt5']}")
+    else:
+        lines.append("- 广度/涨跌停：暂不可用（接口波动）")
+    if themes:
+        theme_line = "；".join([f"{it['theme']} score={it['score']} 涨停={it['count']} 2板+={it['multi_boards']}" for it in themes[:5]])
+        lines.append(f"- 主线题材：{theme_line}")
+    else:
+        lines.append("- 主线题材：暂不可用")
+
+    lines.append("")
+    lines.append("## 自选/持仓体检")
+    if not entries:
+        lines.append("- 当前 watchlist 为空")
+    else:
+        for entry in entries:
+            row = _swing_stock_row(entry["code"], ma_w)
+            eval_result = _evaluate_watch_entry(entry, row, hold)
+            if row:
+                line = (
+                    f"- {entry['code']}: {eval_result['signal']} | 收盘 {row['收盘']} | "
+                    f"距MA{ma_w} {row['距MA%']}% | 近5日 {row['近5日%']}% | {'；'.join(eval_result['reason'])}"
+                )
+                if "pnl_pct" in eval_result:
+                    line += f" | 浮动 {eval_result['pnl_pct']}%"
+                lines.append(line)
+            else:
+                lines.append(f"- {entry['code']}: 数据缺失 | 无法完成体检")
+
+    lines.append("")
+    lines.append("## 明日行动")
+    if stance == "进攻":
+        lines.append("- 围绕主线做强者恒强，优先看分歧后的承接，不追尾盘情绪。")
+    elif stance == "防守":
+        lines.append("- 先控回撤，只保留最确定性计划，触发失效条件就执行。")
+    else:
+        lines.append("- 轻仓观察，等待主线和广度进一步确认。")
+
+    lines.append("")
+    lines.append("## 风险")
+    lines.append("- 若跌停扩张、2板+数量下降、或自选跌破止损/MA，应优先执行纪律。")
+    lines.append("- 以上内容仅供投研辅助，不构成投资建议。")
+
+    text = "\n".join(lines)
+    print(text)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if nightly.get("save_markdown", True):
+        md_path = os.path.join(_REPORTS_DIR, f"nightly_{ts}.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    _save_json(
+        os.path.join(_REPORTS_DIR, f"nightly_{ts}.json"),
+        {"stance": stance, "stats": stats, "themes": themes, "watch_codes": [e["code"] for e in entries]},
+    )
 
 
 def _fetch_zt_pool_df() -> Optional["Any"]:
@@ -844,6 +1048,11 @@ def watchlist_cmd(args: List[str]) -> None:
                             "stop_loss": "止损位/条件",
                             "invalid_if": "逻辑何时失效",
                             "target_days": 10,
+                            "opened_on": "2026-04-01",
+                            "cost_basis": "1450",
+                            "position_pct": "20",
+                            "status": "holding",
+                            "notes": "可选备注",
                         }
                     ],
                     "keywords": ["回购", "增持"],
@@ -869,6 +1078,11 @@ def watchlist_cmd(args: List[str]) -> None:
                     "stop_loss": "",
                     "invalid_if": "",
                     "target_days": 10,
+                    "opened_on": "",
+                    "cost_basis": "",
+                    "position_pct": "",
+                    "status": "watch",
+                    "notes": "",
                 }
             )
             _save()
@@ -892,7 +1106,7 @@ def watchlist_cmd(args: List[str]) -> None:
         code = _normalize_stock_code(args[1].strip())
         field = args[2].strip()
         value = " ".join(args[3:]).strip()
-        allowed = {"thesis", "buy_zone", "stop_loss", "invalid_if", "target_days"}
+        allowed = {"thesis", "buy_zone", "stop_loss", "invalid_if", "target_days", "opened_on", "cost_basis", "position_pct", "status", "notes"}
         if field not in allowed:
             print(f"不支持字段: {field}，可用: {', '.join(sorted(allowed))}")
             sys.exit(1)
@@ -909,6 +1123,11 @@ def watchlist_cmd(args: List[str]) -> None:
                     "stop_loss": "",
                     "invalid_if": "",
                     "target_days": 10,
+                    "opened_on": "",
+                    "cost_basis": "",
+                    "position_pct": "",
+                    "status": "watch",
+                    "notes": "",
                 }
             if obj.get("code") == code:
                 obj[field] = int(value) if field == "target_days" and value.isdigit() else value
@@ -947,6 +1166,7 @@ def main():
         print("  python hub.py scan")
         print("  python hub.py close")
         print("  python hub.py swing      # 波段(~2周)参谋简报")
+        print("  python hub.py nightly    # 晚间参谋简报(适合定时任务)")
         print("  python hub.py watchlist [show|template|add-stock|rm-stock|set-field|add-keyword|rm-keyword] ...")
         sys.exit(1)
 
@@ -959,6 +1179,8 @@ def main():
         close_report()
     elif cmd == "swing":
         swing_advisor_brief()
+    elif cmd == "nightly":
+        nightly_advisor_brief()
     elif cmd == "watchlist":
         watchlist_cmd(sys.argv[2:])
     else:

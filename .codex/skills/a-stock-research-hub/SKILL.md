@@ -33,6 +33,14 @@ python .codex/skills/a-stock-research-hub/scripts/hub.py scan
 python .codex/skills/a-stock-research-hub/scripts/hub.py close
 ```
 
+### 晚间参谋简报（适合定时任务）
+
+适合云端每天晚上自动跑，输出：环境、主线、自选/持仓体检、明日动作，并保存到 `.codex/state/reports/`。
+
+```bash
+python .codex/skills/a-stock-research-hub/scripts/hub.py nightly
+```
+
 ### 波段（约两周，少看盘）· 参谋简报
 
 适合**已选好标的、持有约 10 个交易日**、每周只看 1～2 次盘面的用法：
@@ -49,7 +57,10 @@ python .codex/skills/a-stock-research-hub/scripts/hub.py swing
 
 ```bash
 python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist show
+python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist template
 python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist add-stock 600519
+python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist set-field 600519 thesis 两周波段逻辑
+python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist set-field 600519 stop_loss 1400
 python .codex/skills/a-stock-research-hub/scripts/hub.py watchlist add-keyword 回购
 ```
 

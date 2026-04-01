@@ -65,5 +65,10 @@
     "ma_window": 20,
     "watchlist_snapshot_max": 10,
     "index_kline_days": 12
+  },
+  "nightly": {
+    "enabled": true,
+    "focus_watch_max": 8,
+    "save_markdown": true
   }
 }

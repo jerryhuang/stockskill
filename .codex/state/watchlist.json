@@ -6,7 +6,12 @@
       "buy_zone": "",
       "stop_loss": "",
       "invalid_if": "",
-      "target_days": 10
+      "target_days": 10,
+      "opened_on": "",
+      "cost_basis": "",
+      "position_pct": "",
+      "status": "watch",
+      "notes": ""
     }
   ],
   "keywords": [
