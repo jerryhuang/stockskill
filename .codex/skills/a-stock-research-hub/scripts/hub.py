@@ -511,6 +511,15 @@ def swing_advisor_brief() -> None:
     else:
         print("- 上证日线序列暂不可用")
 
+    print("\n【环境推演】")
+    idx = None
+    try:
+        idx = _index_quotes_df()
+    except Exception:
+        idx = None
+    for line in _market_reasoning_lines({}, idx, []):
+        print(line)
+
     print("\n【自选体检（收盘 vs MA，仅技术位）】")
     if not entries:
         print("- watchlist 无股票。请执行: `hub.py watchlist add-stock 你的代码`")
@@ -543,6 +552,14 @@ def swing_advisor_brief() -> None:
                 print(f"  参谋: {eval_result['signal']} | {'；'.join(eval_result['reason'])}{extra}")
             else:
                 print(f"- {c}: 数据暂不可用")
+
+    print("\n【参谋判断】")
+    for line in _watch_review_lines(entries, ma_w, hold):
+        print(line)
+
+    print("\n【应对剧本】")
+    print("- 若你本周只能看 1~2 次盘，优先盯“是否跌破计划止损/失效条件”，不要被日内波动打乱。")
+    print("- 若环境转弱而个股也跌破 MA，先执行纪律；若环境转强且个股重新站稳 MA，再考虑继续拿。")
 
     print("\n【风险】")
     print("- 数据源波动时部分内容会缺失；重大事件以交易所公告为准。")
@@ -603,6 +620,10 @@ def nightly_advisor_brief() -> None:
         lines.append("- 主线题材：暂不可用")
 
     lines.append("")
+    lines.append("## 推演")
+    lines.extend(_market_reasoning_lines(stats, idx_df, themes))
+
+    lines.append("")
     lines.append("## 自选/持仓体检")
     if not entries:
         lines.append("- 当前 watchlist 为空")
@@ -622,6 +643,10 @@ def nightly_advisor_brief() -> None:
                 lines.append(f"- {entry['code']}: 数据缺失 | 无法完成体检")
 
     lines.append("")
+    lines.append("## 参谋判断")
+    lines.extend(_watch_review_lines(entries, ma_w, hold))
+
+    lines.append("")
     lines.append("## 明日行动")
     if stance == "进攻":
         lines.append("- 围绕主线做强者恒强，优先看分歧后的承接，不追尾盘情绪。")
@@ -629,6 +654,7 @@ def nightly_advisor_brief() -> None:
         lines.append("- 先控回撤，只保留最确定性计划，触发失效条件就执行。")
     else:
         lines.append("- 轻仓观察，等待主线和广度进一步确认。")
+    lines.extend(_playbook_lines(stance, themes))
 
     lines.append("")
     lines.append("## 风险")
@@ -759,6 +785,126 @@ def _stance_from_stats(stats: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[str,
     return "混沌", "结构不清晰：轻仓试错，等待主线与广度确认"
 
 
+def _index_change_map(idx_df) -> Dict[str, float]:
+    mp: Dict[str, float] = {}
+    try:
+        if idx_df is None or idx_df.empty:
+            return mp
+        for _, row in idx_df.iterrows():
+            try:
+                mp[str(row["指数"])] = float(row["涨跌幅"])
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return mp
+
+
+def _market_reasoning_lines(stats: Dict[str, Any], idx_df, themes: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    idx_map = _index_change_map(idx_df)
+
+    if stats:
+        ratio = stats["ratio"]
+        if ratio >= 2:
+            lines.append(f"- 广度明显偏强（涨跌比 {ratio:.2f}），说明今天不是少数权重独涨，而是多数个股参与。")
+        elif ratio <= 0.7:
+            lines.append(f"- 广度偏弱（涨跌比 {ratio:.2f}），哪怕指数稳住，也要提防“指数稳、个股难赚钱”的错觉。")
+        else:
+            lines.append(f"- 广度中性（涨跌比 {ratio:.2f}），市场有赚钱机会，但还没强到可以无脑提高仓位。")
+
+        if stats["limit_up"] >= 80 and stats["limit_down"] <= 15:
+            lines.append(f"- 情绪端偏积极：涨停 {stats['limit_up']} 家、跌停 {stats['limit_down']} 家，短线资金愿意做强者博弈。")
+        elif stats["limit_down"] >= 15:
+            lines.append(f"- 情绪端有压力：跌停 {stats['limit_down']} 家，说明分歧加大，追高容错率偏低。")
+        else:
+            lines.append(f"- 情绪端一般：涨停 {stats['limit_up']} / 跌停 {stats['limit_down']}，更适合精选，不适合铺仓。")
+
+    if idx_map:
+        kechuang = idx_map.get("科创50")
+        hs300 = idx_map.get("沪深300")
+        zz1000 = idx_map.get("中证1000")
+        if kechuang is not None and hs300 is not None:
+            if kechuang - hs300 >= 1:
+                lines.append(f"- 风格上偏成长/科技，科创50（{kechuang:.2f}%）明显强于沪深300（{hs300:.2f}%）。")
+            elif hs300 - kechuang >= 1:
+                lines.append(f"- 风格上更偏权重/防御，沪深300（{hs300:.2f}%）强于科创50（{kechuang:.2f}%）。")
+        if zz1000 is not None and hs300 is not None:
+            if zz1000 - hs300 >= 0.5:
+                lines.append(f"- 小票弹性略强于权重，中证1000（{zz1000:.2f}%）跑赢沪深300（{hs300:.2f}%）。")
+            elif hs300 - zz1000 >= 0.5:
+                lines.append(f"- 权重相对更稳，沪深300（{hs300:.2f}%）强于中证1000（{zz1000:.2f}%）。")
+
+    if themes:
+        top = themes[0]
+        second = themes[1] if len(themes) > 1 else None
+        if second and top["score"] >= second["score"] * 1.8:
+            lines.append(
+                f"- 主线集中度高，{top['theme']} 明显领先（score={top['score']}，2板+={top['multi_boards']}），资金更像在围绕单一主线聚焦。"
+            )
+        elif second:
+            lines.append(
+                f"- 主线更偏轮动而非绝对聚焦，{top['theme']} 与 {second['theme']} 的强度接近，说明分支在竞争注意力。"
+            )
+        if top["multi_boards"] >= 2 or top["max_boards"] >= 3:
+            lines.append(
+                f"- {top['theme']} 不只是首板堆数量，已经出现一定持续性（2板+={top['multi_boards']}，最高连板={top['max_boards']}）。"
+            )
+        else:
+            lines.append(
+                f"- 当前最强题材 {top['theme']} 仍偏首板驱动，若明天没有承接，容易从“热点”退化成“一日游”。"
+            )
+    else:
+        lines.append("- 题材数据缺失时，不宜过度放大主线结论，仓位决策应更保守。")
+
+    return lines
+
+
+def _playbook_lines(stance: str, themes: List[Dict[str, Any]]) -> List[str]:
+    top_name = themes[0]["theme"] if themes else "当前强势方向"
+    if stance == "进攻":
+        return [
+            f"- 剧本A（延续）：如果 {top_name} 明天分歧后仍有承接，优先做主线内部最强分支，而不是追所有跟风。",
+            f"- 剧本B（分歧）：如果 {top_name} 高开弱走、2板+没有扩散，就把它当成强修复后的检验日，先看不急追。",
+            "- 节奏上更适合“围绕核心做聚焦”，而不是题材全面撒网。",
+        ]
+    if stance == "防守":
+        return [
+            "- 剧本A（继续防守）：若跌停扩张或强题材开盘即分化，先守纪律，不因为盘中拉升就追单。",
+            f"- 剧本B（试错反抽）：只有 {top_name} 这类强势方向出现低风险回踩承接，才考虑小仓位试错。",
+            "- 核心目标不是赚快钱，而是避免在退潮段反复止损。",
+        ]
+    return [
+        f"- 剧本A（确认后参与）：如果 {top_name} 明天能带动其他分支扩散，再从观察切换到参与。",
+        "- 剧本B（继续混沌）：若题材切换很快、指数和个股不同步，维持轻仓，把确认放在首位。",
+        "- 这种阶段最怕“看着都行就都买一点”，更适合等一个最明确的方向。",
+    ]
+
+
+def _watch_review_lines(entries: List[Dict[str, Any]], ma_w: int, hold: int) -> List[str]:
+    lines: List[str] = []
+    if not entries:
+        return ["- 当前 watchlist 为空，参谋无法做持仓纪律检查。"]
+
+    for entry in entries:
+        row = _swing_stock_row(entry["code"], ma_w)
+        eval_result = _evaluate_watch_entry(entry, row, hold)
+        if row:
+            summary = (
+                f"- {entry['code']}: {eval_result['signal']}；收盘 {row['收盘']}，距MA{ma_w} {row['距MA%']}%，近5日 {row['近5日%']}%。"
+            )
+            reason = "；".join(eval_result["reason"])
+            if "pnl_pct" in eval_result:
+                summary += f" 浮动约 {eval_result['pnl_pct']}%。"
+            summary += f" 判断依据：{reason}。"
+            if entry.get("invalid_if"):
+                summary += f" 计划失效条件：{entry['invalid_if']}。"
+            lines.append(summary)
+        else:
+            lines.append(f"- {entry['code']}: 数据缺失，今天无法完成计划检查，应以公告/止损纪律为主。")
+    return lines
+
+
 def morning_report() -> None:
     ensure_state_files()
     cfg = _load_json(_config_path(), _default_config())
@@ -855,6 +1001,10 @@ def close_report() -> None:
     else:
         print("- 无法获取涨停池/题材数据（可能非交易时段或接口波动）")
 
+    print("\n推演")
+    for line in _market_reasoning_lines(stats, idx_df, themes):
+        print(line)
+
     print("\n行动（明日）")
     if stance == "防守":
         print("- 明日策略: **控回撤为先**；只做最确定性节点，避免高位接力")
@@ -862,6 +1012,8 @@ def close_report() -> None:
         print("- 明日策略: **围绕主线做强者恒强**；分歧敢低吸，转弱就走")
     else:
         print("- 明日策略: **轻仓试错**；等主线与广度给出一致信号")
+    for line in _playbook_lines(stance, themes):
+        print(line)
 
     print("\n风险（明日关注）")
     print("- 跌停扩张、炸板增多、最高连板断板 → 情绪退潮信号")
@@ -1158,10 +1310,129 @@ def watchlist_cmd(args: List[str]) -> None:
     sys.exit(1)
 
 
+def data_dump() -> None:
+    """输出纯 JSON 结构化数据，供 AI 做深度分析（不含预制结论）。"""
+    ensure_state_files()
+    cfg = _load_json(_config_path(), _default_config())
+    sw = cfg.get("swing", {}) if isinstance(cfg.get("swing"), dict) else {}
+    hold = int(sw.get("hold_days_target", 10))
+    ma_w = int(sw.get("ma_window", 20))
+    kdays = int(sw.get("index_kline_days", 12))
+
+    wl = _load_json(_watchlist_path(), {"stocks": [], "keywords": [], "blacklist": []})
+    blacklist = set(str(x) for x in (wl.get("blacklist") or []))
+    entries = [e for e in _watchlist_entries(wl) if e["code"] not in blacklist]
+
+    result: Dict[str, Any] = {"generated_at": _now_str(), "data_quality": {}}
+
+    # 1) Index quotes
+    idx_list = []
+    try:
+        idx_df = _index_quotes_df()
+        if idx_df is not None and not idx_df.empty:
+            focus = ["上证指数", "深证成指", "创业板指", "科创50", "沪深300", "中证1000", "国证2000"]
+            for name in focus:
+                sub = idx_df[idx_df["指数"] == name]
+                if not sub.empty:
+                    r = sub.iloc[0]
+                    idx_list.append({
+                        "name": name,
+                        "close": round(float(r["最新价"]), 2),
+                        "change_pct": round(float(r["涨跌幅"]), 2),
+                    })
+    except Exception as e:
+        result["data_quality"]["index"] = f"failed: {e}"
+    result["indices"] = idx_list
+
+    # 2) Breadth stats
+    stats = {}
+    try:
+        df_spot = _get_all_spot_df()
+        if df_spot is not None and not df_spot.empty:
+            stats = _breadth_stats_from_spot(df_spot)
+    except Exception as e:
+        result["data_quality"]["breadth"] = f"failed: {e}"
+    result["breadth"] = stats
+
+    # 3) Stance (mechanical, rule-based)
+    if stats:
+        stance, stance_note = _stance_from_stats(stats, cfg)
+    else:
+        stance, stance_note = "unknown", "数据不足"
+    result["mechanical_stance"] = {"stance": stance, "note": stance_note}
+
+    # 4) Themes from ZT pool
+    themes = []
+    try:
+        zt_df = _fetch_zt_pool_df()
+        themes = _themes_from_zt_pool(zt_df, top_n=int(cfg["report"]["top_theme_n"]))
+    except Exception as e:
+        result["data_quality"]["themes"] = f"failed: {e}"
+    result["themes"] = themes
+
+    # 5) Index kline (recent ~12 days)
+    kline_data = {}
+    for secid, label in [("1.000001", "上证指数"), ("0.399006", "创业板指"), ("1.000300", "沪深300")]:
+        k = _index_kline_recent(secid, n=kdays)
+        if k:
+            a, b, chg, amp, cls = k
+            kline_data[label] = {
+                "start_date": a,
+                "end_date": b,
+                "period_change_pct": chg,
+                "period_amplitude_pct": amp,
+                "last_close": cls,
+            }
+    result["index_klines"] = kline_data
+
+    # 6) Watchlist positions with evaluation
+    watch_data = []
+    for entry in entries:
+        row = _swing_stock_row(entry["code"], ma_w)
+        eval_result = _evaluate_watch_entry(entry, row, hold)
+        item: Dict[str, Any] = {
+            "code": entry["code"],
+            "thesis": entry.get("thesis", ""),
+            "stop_loss": entry.get("stop_loss", ""),
+            "invalid_if": entry.get("invalid_if", ""),
+            "target_days": entry.get("target_days", hold),
+            "opened_on": entry.get("opened_on", ""),
+            "cost_basis": entry.get("cost_basis", ""),
+            "position_pct": entry.get("position_pct", ""),
+            "status": entry.get("status", "watch"),
+        }
+        if row:
+            item["market_data"] = {
+                "close": row["收盘"],
+                f"ma{ma_w}": row[f"MA{ma_w}"],
+                "vs_ma": row["vsMA"],
+                "dist_ma_pct": row["距MA%"],
+                "ret_5d_pct": row["近5日%"],
+            }
+        else:
+            item["market_data"] = None
+        item["eval"] = {
+            "signal": eval_result["signal"],
+            "reasons": eval_result["reason"],
+        }
+        if "pnl_pct" in eval_result:
+            item["eval"]["pnl_pct"] = eval_result["pnl_pct"]
+        if "held_days" in eval_result:
+            item["eval"]["held_days"] = eval_result["held_days"]
+        watch_data.append(item)
+    result["watchlist"] = watch_data
+
+    # 7) Config thresholds for reference
+    result["thresholds"] = cfg.get("risk", {})
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def main():
     ensure_state_files()
     if len(sys.argv) < 2:
         print("用法:")
+        print("  python hub.py data       # 纯JSON数据输出（推荐AI使用）")
         print("  python hub.py morning")
         print("  python hub.py scan")
         print("  python hub.py close")
@@ -1171,7 +1442,9 @@ def main():
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
-    if cmd == "morning":
+    if cmd == "data":
+        data_dump()
+    elif cmd == "morning":
         morning_report()
     elif cmd == "scan":
         scan_alerts()

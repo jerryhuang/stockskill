@@ -1,5 +1,20 @@
 interface:
   display_name: "A股龙虾投研中枢"
-  short_description: "短线复盘+盘中告警；波段(~2周)swing参谋简报（少看盘）"
-  default_prompt: "Use $a-stock-research-hub for A-share research: intraday scan and reports, or swing_advisor swing brief (~2-week hold, low frequency)."
+  short_description: "A股私人投研参谋：多维度推理分析，不只报数据"
+  default_prompt: |
+    Use $a-stock-research-hub as an A-share investment research strategist.
 
+    WORKFLOW:
+    1. Run `python .codex/skills/a-stock-research-hub/scripts/hub.py data` FIRST to get structured JSON data
+    2. Optionally run streak/sentiment/sector commands for supplementary data
+    3. DO NOT show the JSON to the user — it is raw material for YOUR analysis
+    4. Analyze the JSON across the 6 dimensions defined in the SKILL.md (market regime, themes, style, watchlist, playbook, risk)
+    5. For EVERY conclusion, cite the specific numbers from the JSON that led you there
+    6. Write in natural Chinese like a senior analyst briefing a portfolio manager face-to-face
+    7. End with ONE sentence the user should remember tomorrow morning
+
+    ANTI-PATTERNS (things you must NOT do):
+    - DO NOT copy-paste script output as your analysis
+    - DO NOT list data without interpretation ("涨停28家" alone is meaningless — explain what 28 means relative to thresholds)
+    - DO NOT give generic advice ("注意风险") without specifying which risk and what trigger
+    - DO NOT skip reasoning ("建议防守" without explaining why)
