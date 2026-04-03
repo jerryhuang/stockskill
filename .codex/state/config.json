@@ -70,5 +70,25 @@
     "enabled": true,
     "focus_watch_max": 8,
     "save_markdown": true
+  },
+  "screen": {
+    "max_price": 70.0,
+    "min_turnover_million": 50,
+    "min_volume_ratio": 0.8,
+    "boards": [
+      "60",
+      "00"
+    ],
+    "exclude_st": true,
+    "top_n_fast": 30,
+    "top_n_final": 10
+  },
+  "discipline": {
+    "stop_loss_pct": -5.0,
+    "take_profit_pct": 15.0,
+    "time_stop_days": 10,
+    "max_position_pct": 100,
+    "entry_min_sentiment": 35,
+    "entry_min_breadth_ratio": 0.4
   }
 }

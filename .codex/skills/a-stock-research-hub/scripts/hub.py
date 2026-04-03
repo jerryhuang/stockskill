@@ -53,15 +53,14 @@ def _save_json(path: str, obj: Any) -> None:
 
 
 def _default_config() -> Dict[str, Any]:
-    # 短线默认阈值：保守取值，避免刷屏
     return {
-        "dedup_ttl_sec": 60 * 60 * 4,  # 同类告警 4h 内只提示一次
+        "dedup_ttl_sec": 60 * 60 * 4,
         "risk": {
-            "breadth_ratio_weak": 0.5,     # 涨跌比<0.5 视为偏弱
-            "breadth_ratio_strong": 1.2,   # 涨跌比>1.2 视为偏强
-            "limit_down_risk": 15,         # 跌停>=15 风险升高
-            "limit_up_good": 80,           # 涨停>=80 赚钱效应较好
-            "down_gt5_risk": 300,          # 跌幅>5%家数过多（来自全市场快照）
+            "breadth_ratio_weak": 0.5,
+            "breadth_ratio_strong": 1.2,
+            "limit_down_risk": 15,
+            "limit_up_good": 80,
+            "down_gt5_risk": 300,
         },
         "watchlist": {
             "max_items": 50,
@@ -83,7 +82,6 @@ def _default_config() -> Dict[str, Any]:
                 "信息": ["回购", "增持", "业绩预告", "预增", "中标", "签订", "重大合同", "分红"],
             },
         },
-        # 波段持有（约 10 个交易日 / 2 周）：偏低频决策，配套「参谋」输出
         "swing": {
             "hold_days_target": 10,
             "review_per_week": 2,
@@ -95,6 +93,23 @@ def _default_config() -> Dict[str, Any]:
             "enabled": True,
             "focus_watch_max": 8,
             "save_markdown": True,
+        },
+        "screen": {
+            "max_price": 70.0,
+            "min_turnover_million": 50,
+            "min_volume_ratio": 0.8,
+            "boards": ["60", "00"],
+            "exclude_st": True,
+            "top_n_fast": 30,
+            "top_n_final": 10,
+        },
+        "discipline": {
+            "stop_loss_pct": -5.0,
+            "take_profit_pct": 15.0,
+            "time_stop_days": 10,
+            "max_position_pct": 100,
+            "entry_min_sentiment": 35,
+            "entry_min_breadth_ratio": 0.4,
         },
     }
 
@@ -1310,6 +1325,325 @@ def watchlist_cmd(args: List[str]) -> None:
     sys.exit(1)
 
 
+# ─────────────────────────────────────────────────────────────
+# Stock Screener
+# ─────────────────────────────────────────────────────────────
+def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """两阶段选股：快速过滤 → K线验证。返回排序后的候选列表。"""
+    import pandas as pd
+    import numpy as np
+
+    scfg = cfg.get("screen", {})
+    max_price = float(scfg.get("max_price", 70))
+    min_turnover = float(scfg.get("min_turnover_million", 50)) * 1e6
+    min_vol_ratio = float(scfg.get("min_volume_ratio", 0.8))
+    boards = scfg.get("boards", ["60", "00"])
+    top_fast = int(scfg.get("top_n_fast", 30))
+    top_final = int(scfg.get("top_n_final", 10))
+    ma_w = int(cfg.get("swing", {}).get("ma_window", 20))
+
+    if df_spot is None or df_spot.empty:
+        return []
+
+    df = df_spot.copy()
+    for col in ["最新价", "涨跌幅", "成交额", "换手率", "量比", "振幅", "市盈率", "流通市值"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Stage 1: fast filter
+    mask = pd.Series(False, index=df.index)
+    for prefix in boards:
+        mask |= df["代码"].str.startswith(prefix)
+    df = df[mask].copy()
+
+    df = df[~df["名称"].str.contains("ST|退市", na=False)]
+    df = df[df["最新价"].notna() & (df["最新价"] > 0) & (df["最新价"] <= max_price)]
+    df = df[df["成交额"].notna() & (df["成交额"] >= min_turnover)]
+    df = df[df["量比"].notna() & (df["量比"] >= min_vol_ratio)]
+    df = df[df["涨跌幅"].notna() & (df["涨跌幅"] > -5) & (df["涨跌幅"] < 9.9)]
+
+    if df.empty:
+        return []
+
+    theme_set = set()
+    for t in (themes or [])[:5]:
+        theme_set.add(t.get("theme", ""))
+
+    def _fast_score(row) -> float:
+        chg = float(row.get("涨跌幅", 0) or 0)
+        vr = float(row.get("量比", 1) or 1)
+        tr = float(row.get("换手率", 0) or 0)
+        score = 0.0
+        if chg > 0:
+            score += min(chg, 8) * 3
+        elif chg < 0:
+            score += chg * 1.5
+        if vr > 1.5:
+            score += min(vr, 5) * 2
+        elif vr < 0.8:
+            score -= 3
+        if 1 <= tr <= 10:
+            score += 2
+        elif tr > 15:
+            score -= 2
+        return round(score, 2)
+
+    df["_score"] = df.apply(_fast_score, axis=1)
+    df = df.sort_values("_score", ascending=False).head(top_fast)
+
+    # Stage 2: K-line verification for top candidates
+    results = []
+    for _, row in df.iterrows():
+        code = str(row["代码"])
+        item: Dict[str, Any] = {
+            "code": code,
+            "name": str(row.get("名称", "")),
+            "price": round(float(row["最新价"]), 2),
+            "change_pct": round(float(row.get("涨跌幅", 0)), 2),
+            "turnover_million": round(float(row.get("成交额", 0)) / 1e6, 1),
+            "volume_ratio": round(float(row.get("量比", 0)), 2),
+            "turnover_rate": round(float(row.get("换手率", 0)), 2),
+            "amplitude": round(float(row.get("振幅", 0)), 2),
+            "fast_score": float(row["_score"]),
+        }
+
+        kline = _swing_stock_row(code, ma_w)
+        if kline:
+            item["ma_position"] = kline["vsMA"]
+            item["dist_ma_pct"] = kline["距MA%"]
+            item["ret_5d_pct"] = kline["近5日%"]
+            item[f"ma{ma_w}"] = kline[f"MA{ma_w}"]
+
+            bonus = 0.0
+            if kline["vsMA"].startswith("站上"):
+                bonus += 5
+            else:
+                bonus -= 8
+            r5 = float(kline["近5日%"])
+            if -3 <= r5 <= 10:
+                bonus += r5 * 0.5
+            elif r5 > 10:
+                bonus -= 2
+            item["final_score"] = round(item["fast_score"] + bonus, 2)
+        else:
+            item["ma_position"] = "未知"
+            item["dist_ma_pct"] = None
+            item["ret_5d_pct"] = None
+            item["final_score"] = round(item["fast_score"] - 5, 2)
+
+        cost_100 = round(item["price"] * 100, 2)
+        item["cost_1lot"] = cost_100
+        item["affordable"] = cost_100 <= 7000
+
+        results.append(item)
+
+    results.sort(key=lambda x: x["final_score"], reverse=True)
+    return results[:top_final]
+
+
+def screen_stocks() -> None:
+    """选股筛选器：输出 JSON 候选列表。"""
+    ensure_state_files()
+    cfg = _load_json(_config_path(), _default_config())
+
+    try:
+        df_spot = _get_all_spot_df()
+    except Exception:
+        df_spot = None
+
+    zt_df = _fetch_zt_pool_df()
+    themes = _themes_from_zt_pool(zt_df, top_n=int(cfg["report"]["top_theme_n"]))
+
+    stats = {}
+    if df_spot is not None and not df_spot.empty:
+        stats = _breadth_stats_from_spot(df_spot)
+
+    stance = "unknown"
+    if stats:
+        stance, _ = _stance_from_stats(stats, cfg)
+
+    candidates = _screen_candidates(df_spot, themes, cfg)
+
+    disc = cfg.get("discipline", {})
+    output = {
+        "generated_at": _now_str(),
+        "market_stance": stance,
+        "breadth_ratio": round(stats.get("ratio", 0), 2) if stats else None,
+        "sentiment_hint": "低迷" if stats and stats.get("ratio", 0) < 0.3 else (
+            "活跃" if stats and stats.get("ratio", 0) > 1.2 else "一般"
+        ),
+        "entry_allowed": (
+            stats.get("ratio", 0) >= disc.get("entry_min_breadth_ratio", 0.4)
+            if stats else False
+        ),
+        "discipline": disc,
+        "candidates_count": len(candidates),
+        "candidates": candidates,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+# ─────────────────────────────────────────────────────────────
+# Trade Journal
+# ─────────────────────────────────────────────────────────────
+def _trades_path() -> str:
+    return os.path.join(_STATE_DIR, "trades.json")
+
+
+def _load_trades() -> List[Dict[str, Any]]:
+    return _load_json(_trades_path(), [])
+
+
+def _save_trades(trades: List[Dict[str, Any]]) -> None:
+    _save_json(_trades_path(), trades)
+
+
+def trade_cmd(args: List[str]) -> None:
+    """交易日志管理。"""
+    ensure_state_files()
+    trades = _load_trades()
+
+    if not args or args[0] == "show":
+        if not trades:
+            print("暂无交易记录。")
+            return
+        open_trades = [t for t in trades if t.get("status") == "open"]
+        closed = [t for t in trades if t.get("status") == "closed"]
+        print(f"=== 交易日志 | 持仓中 {len(open_trades)} 笔 | 已平仓 {len(closed)} 笔 ===\n")
+        for t in trades:
+            tag = "🟢持仓" if t.get("status") == "open" else "⚪已平"
+            pnl_str = ""
+            if t.get("pnl_pct") is not None:
+                pnl_str = f" | 盈亏 {t['pnl_pct']}%"
+            print(
+                f"[{tag}] {t.get('code','')} {t.get('name','')} | "
+                f"买入 {t.get('buy_price','')}×{t.get('shares','')}股 @ {t.get('buy_date','')} | "
+                f"理由: {t.get('buy_reason','')}{pnl_str}"
+            )
+            if t.get("status") == "closed":
+                print(
+                    f"       卖出 {t.get('sell_price','')} @ {t.get('sell_date','')} | "
+                    f"卖出理由: {t.get('sell_reason','')}"
+                )
+        return
+
+    if args[0] == "buy" and len(args) >= 5:
+        code = _normalize_stock_code(args[1])
+        price = float(args[2])
+        shares = int(args[3])
+        reason = " ".join(args[4:])
+        name = ""
+        try:
+            df = _get_all_spot_df()
+            if df is not None:
+                m = df[df["代码"] == code]
+                if not m.empty:
+                    name = str(m.iloc[0].get("名称", ""))
+        except Exception:
+            pass
+        trade: Dict[str, Any] = {
+            "id": f"{code}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "code": code,
+            "name": name,
+            "buy_price": price,
+            "shares": shares,
+            "cost": round(price * shares, 2),
+            "buy_date": date.today().isoformat(),
+            "buy_reason": reason,
+            "status": "open",
+            "stop_loss": round(price * (1 + _load_json(_config_path(), _default_config()).get("discipline", {}).get("stop_loss_pct", -5) / 100), 2),
+            "take_profit": round(price * (1 + _load_json(_config_path(), _default_config()).get("discipline", {}).get("take_profit_pct", 15) / 100), 2),
+        }
+        trades.append(trade)
+        _save_trades(trades)
+        print(f"OK | 已记录买入: {code} {name} {price}×{shares}股")
+        print(f"   自动止损价: {trade['stop_loss']} | 自动止盈价: {trade['take_profit']}")
+        return
+
+    if args[0] == "sell" and len(args) >= 4:
+        code = _normalize_stock_code(args[1])
+        price = float(args[2])
+        reason = " ".join(args[3:])
+        found = False
+        for t in reversed(trades):
+            if t.get("code") == code and t.get("status") == "open":
+                t["sell_price"] = price
+                t["sell_date"] = date.today().isoformat()
+                t["sell_reason"] = reason
+                t["status"] = "closed"
+                t["pnl_pct"] = round((price / t["buy_price"] - 1) * 100, 2)
+                t["pnl_amount"] = round((price - t["buy_price"]) * t["shares"], 2)
+                found = True
+                print(f"OK | 已记录卖出: {code} {price} | 盈亏 {t['pnl_pct']}% ({t['pnl_amount']}元)")
+                break
+        if not found:
+            print(f"未找到 {code} 的持仓记录")
+            return
+        _save_trades(trades)
+        return
+
+    if args[0] == "check":
+        open_trades = [t for t in trades if t.get("status") == "open"]
+        if not open_trades:
+            print("无持仓中的交易。")
+            return
+        disc = _load_json(_config_path(), _default_config()).get("discipline", {})
+        time_stop = int(disc.get("time_stop_days", 10))
+        print(f"=== 持仓纪律检查 | {_now_str()} ===\n")
+        for t in open_trades:
+            code = t["code"]
+            row = _swing_stock_row(code, int(_load_json(_config_path(), _default_config()).get("swing", {}).get("ma_window", 20)))
+            current = row["收盘"] if row else None
+            alerts = []
+            if current:
+                if current <= t.get("stop_loss", 0):
+                    alerts.append(f"已触及止损 {t['stop_loss']}（当前 {current}）→ 应离场")
+                if current >= t.get("take_profit", 99999):
+                    alerts.append(f"已达止盈 {t['take_profit']}（当前 {current}）→ 可分批离场")
+                pnl = round((current / t["buy_price"] - 1) * 100, 2)
+            else:
+                pnl = None
+            buy_date = _parse_date(t.get("buy_date"))
+            if buy_date:
+                held = (date.today() - buy_date).days
+                if held >= time_stop:
+                    if pnl is not None and pnl <= 0:
+                        alerts.append(f"持有 {held} 天无表现（盈亏 {pnl}%）→ 时间止损")
+            pnl_str = f"{pnl}%" if pnl is not None else "N/A"
+            status = "⚠️需操作" if alerts else "✅正常"
+            print(f"[{status}] {code} {t.get('name','')} | 买入 {t['buy_price']} | 当前 {current or 'N/A'} | 盈亏 {pnl_str}")
+            if alerts:
+                for a in alerts:
+                    print(f"    → {a}")
+            else:
+                print(f"    止损 {t.get('stop_loss')} | 止盈 {t.get('take_profit')} | 未触发任何纪律线")
+        return
+
+    if args[0] == "stats":
+        closed = [t for t in trades if t.get("status") == "closed"]
+        if not closed:
+            print("暂无已平仓交易，无法统计。")
+            return
+        wins = [t for t in closed if (t.get("pnl_pct") or 0) > 0]
+        losses = [t for t in closed if (t.get("pnl_pct") or 0) <= 0]
+        total_pnl = sum(t.get("pnl_amount", 0) for t in closed)
+        avg_win = sum(t.get("pnl_pct", 0) for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t.get("pnl_pct", 0) for t in losses) / len(losses) if losses else 0
+        print(f"=== 交易统计 ===")
+        print(f"总交易: {len(closed)} 笔 | 盈利 {len(wins)} 笔 | 亏损 {len(losses)} 笔")
+        print(f"胜率: {len(wins)/len(closed)*100:.1f}%")
+        print(f"平均盈利: {avg_win:.2f}% | 平均亏损: {avg_loss:.2f}%")
+        print(f"盈亏比: {abs(avg_win/avg_loss):.2f}" if avg_loss else "盈亏比: N/A")
+        print(f"累计盈亏: {total_pnl:.2f} 元")
+        return
+
+    print("用法: trade [show|buy|sell|check|stats]")
+    print("  buy <代码> <价格> <股数> <理由>")
+    print("  sell <代码> <价格> <理由>")
+    print("  check    # 检查持仓是否触发纪律线")
+    print("  stats    # 胜率和盈亏统计")
+
+
 def data_dump() -> None:
     """输出纯 JSON 结构化数据，供 AI 做深度分析（不含预制结论）。"""
     ensure_state_files()
@@ -1425,6 +1759,22 @@ def data_dump() -> None:
     # 7) Config thresholds for reference
     result["thresholds"] = cfg.get("risk", {})
 
+    # 8) Screened candidates
+    try:
+        candidates = _screen_candidates(df_spot, themes, cfg)
+        result["screen"] = {
+            "count": len(candidates),
+            "top": candidates[:5],
+        }
+    except Exception as e:
+        result["screen"] = {"count": 0, "error": str(e)}
+
+    # 9) Open trades / discipline check
+    trades = _load_trades()
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    result["open_trades"] = open_trades
+    result["discipline"] = cfg.get("discipline", {})
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -1432,18 +1782,24 @@ def main():
     ensure_state_files()
     if len(sys.argv) < 2:
         print("用法:")
-        print("  python hub.py data       # 纯JSON数据输出（推荐AI使用）")
+        print("  python hub.py data       # 纯JSON数据（含筛选+持仓）")
+        print("  python hub.py screen     # 选股筛选器")
+        print("  python hub.py trade [show|buy|sell|check|stats]")
         print("  python hub.py morning")
         print("  python hub.py scan")
         print("  python hub.py close")
-        print("  python hub.py swing      # 波段(~2周)参谋简报")
-        print("  python hub.py nightly    # 晚间参谋简报(适合定时任务)")
-        print("  python hub.py watchlist [show|template|add-stock|rm-stock|set-field|add-keyword|rm-keyword] ...")
+        print("  python hub.py swing")
+        print("  python hub.py nightly")
+        print("  python hub.py watchlist [show|template|add-stock|...]")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
     if cmd == "data":
         data_dump()
+    elif cmd == "screen":
+        screen_stocks()
+    elif cmd == "trade":
+        trade_cmd(sys.argv[2:])
     elif cmd == "morning":
         morning_report()
     elif cmd == "scan":

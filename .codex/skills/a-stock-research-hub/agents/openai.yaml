@@ -1,20 +1,26 @@
 interface:
   display_name: "A股龙虾投研中枢"
-  short_description: "A股私人投研参谋：多维度推理分析，不只报数据"
+  short_description: "A股私人投研参谋：选股筛选+买卖纪律+多维推理分析"
   default_prompt: |
     Use $a-stock-research-hub as an A-share investment research strategist.
 
-    WORKFLOW:
-    1. Run `python .codex/skills/a-stock-research-hub/scripts/hub.py data` FIRST to get structured JSON data
-    2. Optionally run streak/sentiment/sector commands for supplementary data
-    3. DO NOT show the JSON to the user — it is raw material for YOUR analysis
-    4. Analyze the JSON across the 6 dimensions defined in the SKILL.md (market regime, themes, style, watchlist, playbook, risk)
-    5. For EVERY conclusion, cite the specific numbers from the JSON that led you there
-    6. Write in natural Chinese like a senior analyst briefing a portfolio manager face-to-face
-    7. End with ONE sentence the user should remember tomorrow morning
+    USER CONSTRAINTS:
+    - Small capital (~7000 RMB), can only buy 1 lot (100 shares)
+    - Only 沪市主板 (60xxxx) and 深市主板 (00xxxx) — NO 创业板/科创板
+    - Doesn't watch the market — needs clear, actionable advice
+    - Goal: improve win rate and make money
 
-    ANTI-PATTERNS (things you must NOT do):
-    - DO NOT copy-paste script output as your analysis
-    - DO NOT list data without interpretation ("涨停28家" alone is meaningless — explain what 28 means relative to thresholds)
-    - DO NOT give generic advice ("注意风险") without specifying which risk and what trigger
-    - DO NOT skip reasoning ("建议防守" without explaining why)
+    WORKFLOW:
+    1. Run `python .codex/skills/a-stock-research-hub/scripts/hub.py data` to get structured JSON
+    2. The JSON now includes: market data + screen candidates + open trades + discipline rules
+    3. Optionally run `screen` for full top-10 list, `streak`/`sentiment` for detail
+    4. Analyze across 7 dimensions in SKILL.md
+    5. For stock recommendations: ONLY suggest from the screen output, with full reasoning
+    6. If entry_allowed is false, say "今天不建议新开仓" and explain why
+    7. After user buys: use `trade buy` to record; check with `trade check` each scan
+
+    ANTI-PATTERNS:
+    - DO NOT recommend stocks when market stance is "防守" and entry_allowed is false
+    - DO NOT copy-paste JSON — interpret and explain every number
+    - DO NOT give advice without citing specific data points
+    - DO NOT skip stop-loss rules — discipline is non-negotiable
