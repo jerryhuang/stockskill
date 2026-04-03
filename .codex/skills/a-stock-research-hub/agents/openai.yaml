@@ -12,15 +12,23 @@ interface:
 
     WORKFLOW:
     1. Run `python .codex/skills/a-stock-research-hub/scripts/hub.py data` to get structured JSON
-    2. The JSON now includes: market data + screen candidates + open trades + discipline rules
+    2. The JSON includes: market data + screen Top5 + open trades + discipline rules
     3. Optionally run `screen` for full top-10 list, `streak`/`sentiment` for detail
     4. Analyze across 7 dimensions in SKILL.md
     5. For stock recommendations: ONLY suggest from the screen output, with full reasoning
     6. If entry_allowed is false, say "今天不建议新开仓" and explain why
-    7. After user buys: use `trade buy` to record; check with `trade check` each scan
+    7. When recommending a buy: give specific code, price range, lot size, stop-loss, and reasoning
+    8. User trades manually — when they report back execution, record with `trade buy/sell`
+    9. On each scan, run `trade check` if there are open positions
+
+    TRADING FLOW (user cannot auto-trade):
+    - You suggest → User executes on their broker app → User tells you the result → You record it
+    - Your suggestions must be concrete: "建议买入 000617 中油资本，10.50-10.80 区间，100股（约1060元），止损 10.00"
+    - Never say "可以关注" without a specific action plan
 
     ANTI-PATTERNS:
-    - DO NOT recommend stocks when market stance is "防守" and entry_allowed is false
+    - DO NOT recommend stocks when entry_allowed is false
     - DO NOT copy-paste JSON — interpret and explain every number
-    - DO NOT give advice without citing specific data points
+    - DO NOT give vague advice like "注意风险" — specify which risk and trigger
     - DO NOT skip stop-loss rules — discipline is non-negotiable
+    - DO NOT make heavy API calls — the screener is already optimized for minimal requests

@@ -1326,10 +1326,14 @@ def watchlist_cmd(args: List[str]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Stock Screener
+# Stock Screener — 7因子评分，极少API调用
 # ─────────────────────────────────────────────────────────────
 def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """两阶段选股：快速过滤 → K线验证。返回排序后的候选列表。"""
+    """
+    两阶段选股：
+      Stage 1: 纯 spot 数据 7因子评分（零额外API）
+      Stage 2: 仅对 Top 5 拉K线验证MA位（限速，最多5次请求）
+    """
     import pandas as pd
     import numpy as np
 
@@ -1338,19 +1342,20 @@ def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any
     min_turnover = float(scfg.get("min_turnover_million", 50)) * 1e6
     min_vol_ratio = float(scfg.get("min_volume_ratio", 0.8))
     boards = scfg.get("boards", ["60", "00"])
-    top_fast = int(scfg.get("top_n_fast", 30))
     top_final = int(scfg.get("top_n_final", 10))
     ma_w = int(cfg.get("swing", {}).get("ma_window", 20))
+    kline_verify_n = 5
 
     if df_spot is None or df_spot.empty:
         return []
 
     df = df_spot.copy()
-    for col in ["最新价", "涨跌幅", "成交额", "换手率", "量比", "振幅", "市盈率", "流通市值"]:
+    num_cols = ["最新价", "涨跌幅", "成交额", "换手率", "量比", "振幅", "市盈率", "流通市值", "涨速", "市净率"]
+    for col in num_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Stage 1: fast filter
+    # ── Stage 1: 基础过滤 ──
     mask = pd.Series(False, index=df.index)
     for prefix in boards:
         mask |= df["代码"].str.startswith(prefix)
@@ -1365,34 +1370,106 @@ def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any
     if df.empty:
         return []
 
-    theme_set = set()
+    # 建立热门题材集合（用于板块关联加分）
+    theme_names = set()
     for t in (themes or [])[:5]:
-        theme_set.add(t.get("theme", ""))
+        theme_names.add(t.get("theme", ""))
 
-    def _fast_score(row) -> float:
+    # ── 7因子评分（全部基于 spot，零额外请求）──
+    def _multi_factor_score(row) -> Tuple[float, Dict[str, float]]:
+        details: Dict[str, float] = {}
+
+        # F1: 动量（涨跌幅）—— 正涨幅加分，但接近涨停的扣分（追高风险）
         chg = float(row.get("涨跌幅", 0) or 0)
+        if 0 < chg <= 5:
+            details["动量"] = chg * 3
+        elif 5 < chg <= 8:
+            details["动量"] = 15 + (chg - 5) * 1.5
+        elif chg > 8:
+            details["动量"] = 15  # 接近涨停不再加分，追高风险高
+        else:
+            details["动量"] = chg * 1.5  # 负涨幅扣分
+
+        # F2: 量能异动（量比）—— 1.5-5倍有吸引力
         vr = float(row.get("量比", 1) or 1)
+        if 1.5 <= vr <= 5:
+            details["量能"] = vr * 2.5
+        elif vr > 5:
+            details["量能"] = 12.5 - (vr - 5) * 0.5  # 太高可能是游资对倒
+        elif vr >= 0.8:
+            details["量能"] = 0
+        else:
+            details["量能"] = -3
+
+        # F3: 换手活跃度 —— 1-8% 健康区间
         tr = float(row.get("换手率", 0) or 0)
-        score = 0.0
-        if chg > 0:
-            score += min(chg, 8) * 3
-        elif chg < 0:
-            score += chg * 1.5
-        if vr > 1.5:
-            score += min(vr, 5) * 2
-        elif vr < 0.8:
-            score -= 3
-        if 1 <= tr <= 10:
-            score += 2
-        elif tr > 15:
-            score -= 2
-        return round(score, 2)
+        if 2 <= tr <= 8:
+            details["换手"] = 3
+        elif 1 <= tr < 2 or 8 < tr <= 12:
+            details["换手"] = 1
+        elif tr > 12:
+            details["换手"] = -2  # 过度投机
+        else:
+            details["换手"] = -1
 
-    df["_score"] = df.apply(_fast_score, axis=1)
-    df = df.sort_values("_score", ascending=False).head(top_fast)
+        # F4: 涨速（盘中加速度）—— 正涨速说明资金正在流入
+        speed = float(row.get("涨速", 0) or 0)
+        details["涨速"] = min(max(speed * 2, -4), 6)
 
-    # Stage 2: K-line verification for top candidates
+        # F5: 估值合理性（市盈率）—— 0-80合理，负数或>200不合理
+        pe = row.get("市盈率")
+        if pe is not None and not np.isnan(pe):
+            pe = float(pe)
+            if 0 < pe <= 40:
+                details["估值"] = 3
+            elif 40 < pe <= 80:
+                details["估值"] = 1
+            elif pe > 200 or pe < 0:
+                details["估值"] = -4
+            else:
+                details["估值"] = 0
+        else:
+            details["估值"] = 0
+
+        # F6: 流通市值偏好 —— 30-200亿最佳（小资金能参与、又不至于太小）
+        mcap = row.get("流通市值")
+        if mcap is not None and not np.isnan(mcap):
+            mcap_yi = float(mcap) / 1e8  # 转亿
+            if 30 <= mcap_yi <= 200:
+                details["市值"] = 3
+            elif 15 <= mcap_yi < 30 or 200 < mcap_yi <= 500:
+                details["市值"] = 1
+            elif mcap_yi < 15:
+                details["市值"] = -2  # 太小流动性差
+            else:
+                details["市值"] = 0  # 太大弹性小
+        else:
+            details["市值"] = 0
+
+        # F7: 振幅适度 —— 3-8%有空间但不过分
+        amp = float(row.get("振幅", 0) or 0)
+        if 3 <= amp <= 8:
+            details["振幅"] = 2
+        elif amp > 12:
+            details["振幅"] = -2
+        else:
+            details["振幅"] = 0
+
+        total = round(sum(details.values()), 2)
+        return total, details
+
+    scores = []
+    detail_map = {}
+    for idx, row in df.iterrows():
+        s, d = _multi_factor_score(row)
+        scores.append(s)
+        detail_map[idx] = d
+    df["_score"] = scores
+    df = df.sort_values("_score", ascending=False).head(top_final + kline_verify_n)
+
+    # ── Stage 2: K线验证（仅 Top 5，限速每只间隔2秒）──
     results = []
+    verify_count = 0
     for _, row in df.iterrows():
         code = str(row["代码"])
         item: Dict[str, Any] = {
@@ -1404,32 +1481,36 @@ def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any
             "volume_ratio": round(float(row.get("量比", 0)), 2),
             "turnover_rate": round(float(row.get("换手率", 0)), 2),
             "amplitude": round(float(row.get("振幅", 0)), 2),
+            "pe": round(float(row.get("市盈率", 0)), 1) if row.get("市盈率") and not pd.isna(row["市盈率"]) else None,
+            "market_cap_yi": round(float(row.get("流通市值", 0)) / 1e8, 1) if row.get("流通市值") and not pd.isna(row["流通市值"]) else None,
+            "speed": round(float(row.get("涨速", 0)), 2) if row.get("涨速") and not pd.isna(row["涨速"]) else 0,
             "fast_score": float(row["_score"]),
+            "score_detail": detail_map.get(row.name, {}),
         }
 
-        kline = _swing_stock_row(code, ma_w)
-        if kline:
-            item["ma_position"] = kline["vsMA"]
-            item["dist_ma_pct"] = kline["距MA%"]
-            item["ret_5d_pct"] = kline["近5日%"]
-            item[f"ma{ma_w}"] = kline[f"MA{ma_w}"]
-
-            bonus = 0.0
-            if kline["vsMA"].startswith("站上"):
-                bonus += 5
+        if verify_count < kline_verify_n:
+            if verify_count > 0:
+                time.sleep(2)
+            kline = _swing_stock_row(code, ma_w)
+            verify_count += 1
+            if kline:
+                item["ma_position"] = kline["vsMA"]
+                item["dist_ma_pct"] = kline["距MA%"]
+                item["ret_5d_pct"] = kline["近5日%"]
+                item[f"ma{ma_w}"] = kline[f"MA{ma_w}"]
+                bonus = 5.0 if kline["vsMA"].startswith("站上") else -8.0
+                r5 = float(kline["近5日%"])
+                if -3 <= r5 <= 10:
+                    bonus += r5 * 0.5
+                elif r5 > 10:
+                    bonus -= 2
+                item["final_score"] = round(item["fast_score"] + bonus, 2)
             else:
-                bonus -= 8
-            r5 = float(kline["近5日%"])
-            if -3 <= r5 <= 10:
-                bonus += r5 * 0.5
-            elif r5 > 10:
-                bonus -= 2
-            item["final_score"] = round(item["fast_score"] + bonus, 2)
+                item["ma_position"] = "K线不可用"
+                item["final_score"] = item["fast_score"]
         else:
-            item["ma_position"] = "未知"
-            item["dist_ma_pct"] = None
-            item["ret_5d_pct"] = None
-            item["final_score"] = round(item["fast_score"] - 5, 2)
+            item["ma_position"] = "未验证"
+            item["final_score"] = item["fast_score"]
 
         cost_100 = round(item["price"] * 100, 2)
         item["cost_1lot"] = cost_100
