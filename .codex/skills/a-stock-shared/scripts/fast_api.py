@@ -19,10 +19,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 #  缓存配置（秒）- 交易时段建议 30-60s，非交易时段可更长
 # ═══════════════════════════════════════════════════════════
 CACHE_TTL = {
-    "index": 30,        # 指数行情
-    "all_spot": 60,     # 全市场行情（最重的请求）
-    "fund_flow": 120,   # 个股资金流向
-    "default": 60,
+    "index": 180,       # 指数行情（3分钟）
+    "all_spot": 300,    # 全市场行情（5分钟，最重的请求）
+    "fund_flow": 300,   # 个股资金流向（5分钟）
+    "default": 180,     # 其他（3分钟）
 }
 
 _CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
