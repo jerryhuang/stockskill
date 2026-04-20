@@ -20,6 +20,8 @@ pip install akshare pandas tabulate
 - `get_index_quotes()` → 主要指数行情（单次请求，~7秒）
 - `get_all_a_stock_spot()` → 全市场行情（~5800只，并行分页，~15-30秒）
 - `get_stock_individual_fund_flow(code)` → 个股资金流向30日
+- `get_em_daily_kline_df(secid, n)` → 东方财富 **前复权日K** OHLC（`secid` 如 `1.600519`、`1.000001`，时间升序，带缓存）
+- `get_stock_daily_kline_close(code, n)` → 6 位 A 股代码的日K **收盘价**序列（同上数据源，供投研中枢周线概率等使用）
 
 ## 特性
 

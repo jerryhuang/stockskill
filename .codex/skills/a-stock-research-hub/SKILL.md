@@ -26,14 +26,20 @@ description: A股投研编排中枢：选股筛选、买卖纪律、交易日志
 
 ```bash
 # 全量数据 JSON（环境+筛选+持仓，一条命令搞定）
-python .codex/skills/a-stock-research-hub/scripts/hub.py data
+python3 .codex/skills/a-stock-research-hub/scripts/hub.py data
+python3 .codex/skills/a-stock-research-hub/scripts/hub.py data-intel   # 仅情报（合并 monitor 缓存，Web Worker 休市轮询用）
 
 # 选股筛选器（独立运行，输出候选列表）
-python .codex/skills/a-stock-research-hub/scripts/hub.py screen
+python3 .codex/skills/a-stock-research-hub/scripts/hub.py screen
 ```
 
-`data` 输出包含：指数、广度、题材、K线、自选评估、**筛选候选 Top5**、持仓纪律状态。
-`screen` 输出完整的 Top10 候选列表及评分。
+`data` 输出包含：指数、广度、题材、K线、自选评估、**筛选候选 Top5**、持仓纪律状态；自选/持仓/候选附带 **`week_forward`**（约 5 个交易日收涨概率的启发式估计，已融合均线、RSI、波动率、全市场涨跌比与环境基调，非预测保证）。
+`screen` 输出完整的 Top10 候选列表及评分（含 `week_forward`）。
+
+```bash
+python .codex/skills/a-stock-research-hub/scripts/hub.py weekprob 600519   # 单票快速查看
+python .codex/skills/a-stock-research-hub/scripts/hub.py doctor            # 自检（东财K线、快照、K线链路）
+```
 
 ### 交易日志
 

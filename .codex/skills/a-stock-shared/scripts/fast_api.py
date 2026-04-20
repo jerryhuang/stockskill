@@ -22,6 +22,7 @@ CACHE_TTL = {
     "index": 180,       # 指数行情（3分钟）
     "all_spot": 300,    # 全市场行情（5分钟，最重的请求）
     "fund_flow": 300,   # 个股资金流向（5分钟）
+    "stock_kline": 600,  # 个股/指数日K（10分钟）
     "default": 180,     # 其他（3分钟）
 }
 
@@ -335,6 +336,77 @@ def get_index_quotes() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def get_em_daily_kline_df(secid: str, n: int = 120) -> pd.DataFrame:
+    """
+    东方财富 push2his 日K（klt=101 日线，fqt=1 前复权），时间升序。
+    secid 示例：1.600519（沪市股）、0.000001（深市股）、1.000001（上证指数）。
+    """
+    from urllib.parse import urlencode
+
+    n = max(5, min(int(n), 800))
+    cache_key = f"em_kline_daily_qfq_{secid}_{n}"
+    cached = _cache_get(cache_key, CACHE_TTL.get("stock_kline", 600))
+    if cached is not None:
+        return pd.DataFrame(cached)
+
+    params = {
+        "secid": secid,
+        "klt": "101",
+        "fqt": "1",
+        "lmt": str(n),
+        "end": "20500101",
+        "beg": "0",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + urlencode(params)
+    try:
+        j = _get(url)
+    except Exception:
+        return pd.DataFrame()
+
+    lines = ((j or {}).get("data") or {}).get("klines") or []
+    rows = []
+    for line in lines:
+        p = line.split(",")
+        if len(p) >= 5:
+            try:
+                rows.append({
+                    "日期": p[0],
+                    "开盘": float(p[1]),
+                    "收盘": float(p[2]),
+                    "最高": float(p[3]),
+                    "最低": float(p[4]),
+                })
+            except (ValueError, TypeError):
+                continue
+
+    df = pd.DataFrame(rows)
+    if len(df) > n:
+        df = df.iloc[-n:].reset_index(drop=True)
+        rows = df.to_dict("records")
+
+    _cache_set(cache_key, rows)
+    return pd.DataFrame(rows)
+
+
+def get_stock_daily_kline_close(code: str, n: int = 160) -> pd.Series:
+    """
+    6 位 A 股代码的前复权日K收盘价序列（时间升序），与全市场快照同源走东方财富接口。
+    失败返回空 Series。
+    """
+    code = str(code).strip()
+    if len(code) >= 8 and code[:2] in ("sh", "sz"):
+        code = code[-6:]
+    if not code.isdigit() or len(code) != 6:
+        return pd.Series(dtype=float)
+    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+    df = get_em_daily_kline_df(secid, n=n)
+    if df.empty or "收盘" not in df.columns:
+        return pd.Series(dtype=float)
+    return df["收盘"].astype(float).reset_index(drop=True)
 
 
 def get_stock_individual_fund_flow(code: str) -> pd.DataFrame:

@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -111,6 +111,12 @@ def _default_config() -> Dict[str, Any]:
             "entry_min_sentiment": 35,
             "entry_min_breadth_ratio": 0.4,
         },
+        "week_forward": {
+            "horizon_sessions": 5,
+            "min_bars": 35,
+            "p_pct_floor": 18,
+            "p_pct_cap": 82,
+        },
     }
 
 
@@ -156,6 +162,10 @@ def ensure_state_files() -> None:
             merged_nightly = _default_config()["nightly"]
             merged_nightly.update(cfg["nightly"])
             merged["nightly"] = merged_nightly
+        if isinstance(cfg.get("week_forward"), dict):
+            merged_wf = _default_config()["week_forward"]
+            merged_wf.update(cfg["week_forward"])
+            merged["week_forward"] = merged_wf
         _save_json(cfg_path, merged)
 
     wl_path = _watchlist_path()
@@ -338,58 +348,220 @@ def _keyword_match_level(
     return None, None, False
 
 
-def _index_kline_recent(secid: str, n: int = 12) -> Optional[Tuple[str, str, float, float, float]]:
-    """返回 (起始日, 结束日, 区间涨跌%, 区间振幅%, 最新收盘) 或 None。"""
-    params = {
-        "secid": secid,
-        "klt": "101",
-        "fqt": "1",
-        "lmt": str(max(5, min(int(n), 30))),
-        "end": "20500101",
-        "beg": "0",
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-    }
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    j = None
-    try:
-        from curl_cffi import requests as curlreq
+def _akshare_daily_close_series(code: str) -> Any:
+    """AkShare 前复权日收（时间升序），仅在东财数据不足时作补全。"""
+    import akshare as ak
 
-        r = curlreq.get(url, params=params, timeout=30, impersonate="chrome110")
-        j = r.json()
-    except Exception:
+    try:
+        start = (date.today() - timedelta(days=550)).strftime("%Y%m%d")
+        end = date.today().strftime("%Y%m%d")
         try:
-            import requests as _rq
-
-            r = _rq.get(
-                url,
-                params=params,
-                timeout=30,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    "Referer": "https://quote.eastmoney.com/",
-                },
+            df = ak.stock_zh_a_hist(
+                symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq"
             )
-            j = r.json()
-        except Exception:
+        except TypeError:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+        if df is None or df.empty:
             return None
+        close_col = next((c for c in df.columns if "收盘" in str(c)), None)
+        if not close_col:
+            return None
+        return df[close_col].astype(float).reset_index(drop=True)
+    except Exception:
+        return None
 
+
+def _stock_daily_close_series(code: str) -> Any:
+    """前复权日收盘价（时间升序）：优先 a-stock-shared / 东方财富日K，不足则 AkShare。"""
+    from fast_api import get_stock_daily_kline_close
+
+    code = _normalize_stock_code(code)
+    if not code or not code.isdigit():
+        return None
+    s_em = get_stock_daily_kline_close(code, n=220)
+    s_ak = None
+    if s_em is None or len(s_em) < 30:
+        s_ak = _akshare_daily_close_series(code)
+    if s_em is not None and len(s_em) >= 30:
+        return s_em
+    if s_ak is not None and len(s_ak) >= 30:
+        return s_ak
+    if s_em is not None and len(s_em) > 0:
+        return s_em
+    if s_ak is not None and len(s_ak) > 0:
+        return s_ak
+    return None
+
+
+def _swing_row_from_close_series(s: Any, ma_w: int, code: str) -> Optional[Dict[str, Any]]:
+    if s is None or len(s) < ma_w + 2:
+        return None
+    last = float(s.iloc[-1])
+    ma = float(s.tail(ma_w).mean())
+    base5 = float(s.iloc[-6]) if len(s) >= 6 else float(s.iloc[0])
+    ret5 = (last / base5 - 1) * 100 if base5 else 0.0
+    pos = "站上MA" if last >= ma else "跌破MA"
+    return {
+        "代码": code,
+        "收盘": round(last, 2),
+        f"MA{ma_w}": round(ma, 2),
+        "vsMA": pos,
+        "近5日%": round(ret5, 2),
+        "距MA%": round((last / ma - 1) * 100, 2) if ma else 0.0,
+    }
+
+
+def _week_forward_prob_from_series(
+    s: Any,
+    ma_w: int,
+    market_ctx: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    约 5 个交易日收涨概率的启发式估计（logit 打分），用于参谋辅助，非保证预测。
+    """
+    import math
+
+    import pandas as pd
+
+    wcfg = cfg.get("week_forward") if isinstance(cfg.get("week_forward"), dict) else {}
+    min_bars = int(wcfg.get("min_bars", 35))
+    horizon = int(wcfg.get("horizon_sessions", 5))
+    p_floor = float(wcfg.get("p_pct_floor", 18)) / 100.0
+    p_cap = float(wcfg.get("p_pct_cap", 82)) / 100.0
+    base_out: Dict[str, Any] = {
+        "horizon_sessions": horizon,
+        "p_up_pct": None,
+        "bias": "未知",
+        "confidence": "低",
+        "drivers": [],
+        "features": {},
+        "typical_abs_move_pct_5d": None,
+        "method": "东方财富前复权日K + 均线/RSI/波动 + 市场广度 启发式 logit",
+        "disclaimer": "基于历史价量特征的粗估，不构成投资建议",
+    }
+    if s is None:
+        base_out["drivers"].append("无法获取日K收盘价序列")
+        return base_out
+    if len(s) < min_bars:
+        base_out["drivers"].append(f"有效K线不足{min_bars}根，未计算概率")
+        return base_out
+
+    last = float(s.iloc[-1])
+    ma = float(s.tail(ma_w).mean()) if len(s) >= ma_w else float(s.mean())
+    dist_ma_pct = (last / ma - 1) * 100 if ma else 0.0
+    base5 = float(s.iloc[-6]) if len(s) >= 6 else float(s.iloc[0])
+    ret5 = (last / base5 - 1) * 100 if base5 else 0.0
+    base10 = float(s.iloc[-11]) if len(s) >= 11 else float(s.iloc[0])
+    ret10 = (last / base10 - 1) * 100 if base10 else 0.0
+
+    chg = s.pct_change()
+    vol20 = float(chg.tail(20).std()) if len(chg) >= 21 else float(chg.iloc[1:].std())
+
+    gain = chg.clip(lower=0.0)
+    loss = (-chg).clip(lower=0.0)
+    avg_gain = float(gain.tail(14).mean()) if len(gain) >= 15 else float(gain.mean())
+    avg_loss = float(loss.tail(14).mean()) if len(loss) >= 15 else float(loss.mean())
+    if avg_loss > 1e-12:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+    else:
+        rsi = 100.0 if avg_gain > 0 else 50.0
+    if pd.isna(rsi):
+        rsi = 50.0
+
+    mom = math.tanh(ret5 / 7.0)
+    trend = math.tanh(dist_ma_pct / 5.0)
+    mom2 = math.tanh(ret10 / 12.0) * 0.35
+
+    if rsi < 32:
+        rsi_term = 0.22
+    elif rsi > 72:
+        rsi_term = -0.18
+    else:
+        rsi_term = (rsi - 50.0) / 120.0
+
+    vol_pen = -0.45 * math.tanh(vol20 / 0.025)
+
+    breadth_term = 0.0
+    br = None
+    if market_ctx:
+        br = market_ctx.get("breadth_ratio")
+        if br is not None and isinstance(br, (int, float)):
+            breadth_term = 0.38 * math.tanh((float(br) - 1.0) * 1.1)
+
+    stance = str(market_ctx.get("stance", "")) if market_ctx else ""
+    stance_term = 0.0
+    if stance == "进攻":
+        stance_term = 0.12
+    elif stance == "防守":
+        stance_term = -0.22
+    elif stance in ("混沌", "unknown"):
+        stance_term = -0.05
+
+    logit = 0.95 * mom + 0.75 * trend + mom2 + 0.4 * rsi_term + vol_pen + breadth_term + stance_term
+    logit = max(-2.8, min(2.8, logit))
+    p = 1.0 / (1.0 + math.exp(-logit))
+    p = max(p_floor, min(p_cap, p))
+
+    typ_move = vol20 * math.sqrt(float(horizon)) * 100
+
+    drivers: List[str] = []
+    if ret5 > 1:
+        drivers.append(f"近5日偏强({ret5:.1f}%)")
+    elif ret5 < -2:
+        drivers.append(f"近5日偏弱({ret5:.1f}%)")
+    if dist_ma_pct > 0.5:
+        drivers.append(f"收盘高于MA{ma_w}约{dist_ma_pct:.1f}%")
+    elif dist_ma_pct < -0.5:
+        drivers.append(f"低于MA{ma_w}约{abs(dist_ma_pct):.1f}%")
+    if rsi < 35:
+        drivers.append("RSI超卖区，模型略上调短线反弹权重")
+    elif rsi > 68:
+        drivers.append("RSI偏高，模型略上调震荡/回撤权重")
+    if br is not None and isinstance(br, (int, float)):
+        drivers.append(f"全市场涨跌比约{float(br):.2f}")
+    if stance in ("进攻", "防守", "混沌"):
+        drivers.append(f"机械环境基调：{stance}")
+
+    conf = "中"
+    if len(s) >= 90 and vol20 < 0.022:
+        conf = "高"
+    elif len(s) < min_bars + 15 or vol20 > 0.04:
+        conf = "低"
+
+    label = "偏多" if p >= 0.55 else "偏空" if p <= 0.45 else "中性"
+
+    base_out["p_up_pct"] = round(p * 100, 1)
+    base_out["bias"] = label
+    base_out["confidence"] = conf
+    base_out["drivers"] = drivers[:6]
+    base_out["features"] = {
+        "ret_5d_pct": round(ret5, 2),
+        "ret_10d_pct": round(ret10, 2),
+        "dist_ma_pct": round(dist_ma_pct, 2),
+        "rsi14": round(rsi, 1),
+        "vol20_daily_pct": round(vol20 * 100, 3),
+    }
+    base_out["typical_abs_move_pct_5d"] = round(typ_move, 2)
+    return base_out
+
+
+def _index_kline_recent(secid: str, n: int = 12) -> Optional[Tuple[str, str, float, float, float]]:
+    """返回 (起始日, 结束日, 区间涨跌%, 区间振幅%, 最新收盘) 或 None。走 fast_api 东方财富日K。"""
+    from fast_api import get_em_daily_kline_df
+
+    take = max(5, min(int(n), 30))
+    df = get_em_daily_kline_df(secid, n=take)
+    if df.empty or len(df) < 5:
+        return None
     try:
-        kl = (j or {}).get("data", {}).get("klines", [])
-        if not kl:
-            return None
-        take = max(5, min(int(n), 30))
-        kl = kl[-take:]
-        rows = []
-        for s in kl:
-            parts = s.split(",")
-            if len(parts) >= 5:
-                d, _o, c, h, low = parts[0], parts[1], parts[2], parts[3], parts[4]
-                rows.append((d, float(c), float(h), float(low)))
-        if not rows:
-            return None
-        start_d, start_c, _, _ = rows[0]
-        end_d, end_c, hi, lo = rows[-1][0], rows[-1][1], max(r[2] for r in rows), min(r[3] for r in rows)
+        start_d = str(df.iloc[0]["日期"])
+        start_c = float(df.iloc[0]["收盘"])
+        end_d = str(df.iloc[-1]["日期"])
+        end_c = float(df.iloc[-1]["收盘"])
+        hi = float(df["最高"].max())
+        lo = float(df["最低"].min())
         chg = (end_c - start_c) / start_c * 100 if start_c else 0.0
         amp = (hi - lo) / start_c * 100 if start_c else 0.0
         return start_d, end_d, round(chg, 2), round(amp, 2), end_c
@@ -398,34 +570,11 @@ def _index_kline_recent(secid: str, n: int = 12) -> Optional[Tuple[str, str, flo
 
 
 def _swing_stock_row(code: str, ma_w: int) -> Optional[Dict[str, Any]]:
-    import akshare as ak
-
     code = _normalize_stock_code(code)
-    if not code or not code.isdigit():
+    s = _stock_daily_close_series(code)
+    if s is None:
         return None
-    try:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-        if df is None or df.empty or len(df) < ma_w + 2:
-            return None
-        close_col = next((c for c in df.columns if "收盘" in str(c)), None)
-        if not close_col:
-            return None
-        s = df[close_col].astype(float)
-        last = float(s.iloc[-1])
-        ma = float(s.tail(ma_w).mean())
-        base5 = float(s.iloc[-6]) if len(s) >= 6 else float(s.iloc[0])
-        ret5 = (last / base5 - 1) * 100 if base5 else 0.0
-        pos = "站上MA" if last >= ma else "跌破MA"
-        return {
-            "代码": code,
-            "收盘": round(last, 2),
-            f"MA{ma_w}": round(ma, 2),
-            "vsMA": pos,
-            "近5日%": round(ret5, 2),
-            "距MA%": round((last / ma - 1) * 100, 2) if ma else 0.0,
-        }
-    except Exception:
-        return None
+    return _swing_row_from_close_series(s, ma_w, code)
 
 
 def _evaluate_watch_entry(entry: Dict[str, Any], row: Optional[Dict[str, Any]], default_hold_days: int) -> Dict[str, Any]:
@@ -1328,7 +1477,13 @@ def watchlist_cmd(args: List[str]) -> None:
 # ─────────────────────────────────────────────────────────────
 # Stock Screener — 7因子评分，极少API调用
 # ─────────────────────────────────────────────────────────────
-def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _screen_candidates(
+    df_spot,
+    themes: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    market_ctx: Optional[Dict[str, Any]] = None,
+    stock_series_getter: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     """
     两阶段选股：
       Stage 1: 纯 spot 数据 7因子评分（零额外API）
@@ -1369,6 +1524,11 @@ def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any
 
     if df.empty:
         return []
+
+    def _get_series(sym: str) -> Any:
+        if stock_series_getter:
+            return stock_series_getter(sym)
+        return _stock_daily_close_series(sym)
 
     # 建立热门题材集合（用于板块关联加分）
     theme_names = set()
@@ -1491,7 +1651,8 @@ def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any
         if verify_count < kline_verify_n:
             if verify_count > 0:
                 time.sleep(2)
-            kline = _swing_stock_row(code, ma_w)
+            s = _get_series(code)
+            kline = _swing_row_from_close_series(s, ma_w, code) if s is not None and len(s) >= ma_w + 2 else None
             verify_count += 1
             if kline:
                 item["ma_position"] = kline["vsMA"]
@@ -1505,9 +1666,13 @@ def _screen_candidates(df_spot, themes: List[Dict[str, Any]], cfg: Dict[str, Any
                 elif r5 > 10:
                     bonus -= 2
                 item["final_score"] = round(item["fast_score"] + bonus, 2)
+                if market_ctx and s is not None:
+                    item["week_forward"] = _week_forward_prob_from_series(s, ma_w, market_ctx, cfg)
             else:
                 item["ma_position"] = "K线不可用"
                 item["final_score"] = item["fast_score"]
+                if market_ctx and s is not None:
+                    item["week_forward"] = _week_forward_prob_from_series(s, ma_w, market_ctx, cfg)
         else:
             item["ma_position"] = "未验证"
             item["final_score"] = item["fast_score"]
@@ -1540,10 +1705,13 @@ def screen_stocks() -> None:
         stats = _breadth_stats_from_spot(df_spot)
 
     stance = "unknown"
+    br = None
     if stats:
         stance, _ = _stance_from_stats(stats, cfg)
+        br = stats.get("ratio")
+    mctx = {"breadth_ratio": br, "stance": stance}
 
-    candidates = _screen_candidates(df_spot, themes, cfg)
+    candidates = _screen_candidates(df_spot, themes, cfg, market_ctx=mctx)
 
     disc = cfg.get("discipline", {})
     output = {
@@ -1725,6 +1893,38 @@ def trade_cmd(args: List[str]) -> None:
     print("  stats    # 胜率和盈亏统计")
 
 
+def _monitor_latest_json_path() -> str:
+    return os.path.join(_STATE_DIR, "monitor_latest.json")
+
+
+def data_intel_only_dump() -> None:
+    """
+    休市/盘后轮询：不拉取全市场行情，仅刷新 intel 情报并合并上一轮 monitor 快照。
+    若无可用缓存则自动降级为完整 data_dump。
+    """
+    ensure_state_files()
+    prev = _load_json(_monitor_latest_json_path(), {})
+    payload = prev.get("data") if isinstance(prev.get("data"), dict) else {}
+    has_cache = bool(payload.get("indices") or payload.get("breadth"))
+    if not has_cache:
+        data_dump()
+        return
+    result = dict(payload)
+    result["generated_at"] = _now_str()
+    result["data_mode"] = "intel_only"
+    result["quotes_note"] = (
+        "休市或非连续竞价时段：未重新拉取全市场行情；指数/广度/题材/选股/自选技术位等为缓存快照，"
+        "请以 intel 情报与下一交易时段行情为准。"
+    )
+    try:
+        from intel_collector import collect_all_intel
+
+        result["intel"] = collect_all_intel()
+    except Exception as e:
+        result["intel"] = {"error": str(e)[:300]}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def data_dump() -> None:
     """输出纯 JSON 结构化数据，供 AI 做深度分析（不含预制结论）。"""
     ensure_state_files()
@@ -1738,7 +1938,11 @@ def data_dump() -> None:
     blacklist = set(str(x) for x in (wl.get("blacklist") or []))
     entries = [e for e in _watchlist_entries(wl) if e["code"] not in blacklist]
 
-    result: Dict[str, Any] = {"generated_at": _now_str(), "data_quality": {}}
+    result: Dict[str, Any] = {
+        "generated_at": _now_str(),
+        "data_mode": "full",
+        "data_quality": {},
+    }
 
     # 1) Index quotes
     idx_list = []
@@ -1800,10 +2004,20 @@ def data_dump() -> None:
             }
     result["index_klines"] = kline_data
 
+    series_mem: Dict[str, Any] = {}
+
+    def series_getter(c: str) -> Any:
+        if c not in series_mem:
+            series_mem[c] = _stock_daily_close_series(c)
+        return series_mem[c]
+
+    mctx = {"breadth_ratio": stats.get("ratio") if stats else None, "stance": stance}
+
     # 6) Watchlist positions with evaluation
     watch_data = []
     for entry in entries:
-        row = _swing_stock_row(entry["code"], ma_w)
+        s = series_getter(entry["code"])
+        row = _swing_row_from_close_series(s, ma_w, entry["code"]) if s is not None else None
         eval_result = _evaluate_watch_entry(entry, row, hold)
         item: Dict[str, Any] = {
             "code": entry["code"],
@@ -1834,6 +2048,8 @@ def data_dump() -> None:
             item["eval"]["pnl_pct"] = eval_result["pnl_pct"]
         if "held_days" in eval_result:
             item["eval"]["held_days"] = eval_result["held_days"]
+        if s is not None:
+            item["week_forward"] = _week_forward_prob_from_series(s, ma_w, mctx, cfg)
         watch_data.append(item)
     result["watchlist"] = watch_data
 
@@ -1842,7 +2058,9 @@ def data_dump() -> None:
 
     # 8) Screened candidates
     try:
-        candidates = _screen_candidates(df_spot, themes, cfg)
+        candidates = _screen_candidates(
+            df_spot, themes, cfg, market_ctx=mctx, stock_series_getter=series_getter
+        )
         result["screen"] = {
             "count": len(candidates),
             "top": candidates[:5],
@@ -1853,30 +2071,175 @@ def data_dump() -> None:
     # 9) Open trades / discipline check
     trades = _load_trades()
     open_trades = [t for t in trades if t.get("status") == "open"]
-    result["open_trades"] = open_trades
+    ot_enriched: List[Dict[str, Any]] = []
+    for t in open_trades:
+        tt = dict(t)
+        oc = _normalize_stock_code(str(t.get("code", "")))
+        if oc:
+            s = series_getter(oc)
+            if s is not None:
+                tt["week_forward"] = _week_forward_prob_from_series(s, ma_w, mctx, cfg)
+        ot_enriched.append(tt)
+    result["open_trades"] = ot_enriched
     result["discipline"] = cfg.get("discipline", {})
+    wf_cfg = cfg.get("week_forward") if isinstance(cfg.get("week_forward"), dict) else {}
+    result["week_forward_model"] = {
+        "horizon_sessions": int(wf_cfg.get("horizon_sessions", 5)),
+        "meaning": "约5个交易日收涨（收盘高于当前）的启发式概率；日K来自东方财富（a-stock-shared），并融合均线/RSI/波动与全市场涨跌比、环境基调",
+    }
+
+    # 10) 前瞻性情报采集
+    try:
+        from intel_collector import collect_all_intel
+        result["intel"] = collect_all_intel()
+    except Exception as e:
+        result["intel"] = {"error": str(e)[:300]}
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def doctor_cmd() -> None:
+    """环境自检：东方财富 K 线、全市场快照、周线概率链路（ stdout 人类可读 ）。"""
+    import time
+
+    ensure_state_files()
+    print("=== 龙虾投研 hub.py doctor ===\n")
+
+    t0 = time.perf_counter()
+    _last = t0
+
+    def step(name: str) -> None:
+        nonlocal _last
+        now = time.perf_counter()
+        print(f"• {name}  (+{now - _last:.1f}s，累计 {now - t0:.1f}s)")
+        _last = now
+
+    ok = True
+    try:
+        from fast_api import get_em_daily_kline_df, get_stock_daily_kline_close
+
+        s = get_stock_daily_kline_close("600519", n=45)
+        step("fast_api.get_stock_daily_kline_close(600519)")
+        if s is None or len(s) < 35:
+            print(f"  ❌ 日K不足: len={0 if s is None else len(s)}（需≥35 根才算周线概率）")
+            ok = False
+        else:
+            print(f"  ✅ len={len(s)}  最新收盘≈{float(s.iloc[-1]):.2f}")
+
+        df = get_em_daily_kline_df("1.000001", n=12)
+        step("fast_api.get_em_daily_kline_df(上证指数)")
+        if df.empty or len(df) < 5:
+            print(f"  ❌ 指数K线异常: rows={len(df)}")
+            ok = False
+        else:
+            print(f"  ✅ rows={len(df)}  区间 {df.iloc[0]['日期']} ~ {df.iloc[-1]['日期']}")
+    except Exception as e:
+        print(f"  ❌ fast_api: {e}")
+        ok = False
+
+    try:
+        df_spot = _get_all_spot_df()
+        step("_get_all_spot_df()")
+        if df_spot is None or df_spot.empty:
+            print("  ❌ 全市场快照为空")
+            ok = False
+        else:
+            print(f"  ✅ {len(df_spot)} 只")
+    except Exception as e:
+        print(f"  ❌ spot: {e}")
+        ok = False
+
+    try:
+        cfg = _load_json(_config_path(), _default_config())
+        ma_w = int(cfg.get("swing", {}).get("ma_window", 20))
+        s2 = _stock_daily_close_series("600519")
+        step("_stock_daily_close_series(600519) [hub 合并东财+AkShare]")
+        if s2 is None or len(s2) < 30:
+            print(f"  ❌ len={0 if s2 is None else len(s2)}")
+            ok = False
+        else:
+            row = _swing_row_from_close_series(s2, ma_w, "600519")
+            print(f"  ✅ len={len(s2)}  MA位: {row['vsMA'] if row else '—'}")
+    except Exception as e:
+        print(f"  ❌ hub K线链路: {e}")
+        ok = False
+
+    try:
+        from intel_collector import collect_all_intel  # type: ignore
+
+        step("intel_collector 导入")
+        print("  ✅ 模块存在（完整采集较慢，doctor 不自动跑 collect_all_intel）")
+    except Exception as e:
+        print(f"  ⚠ intel_collector: {e}（hub data 里 intel 可能为空）")
+
+    print(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
+    print("\n提示: `hub.py data` 必须 **完整输出** JSON；若 `| head` 管道会触发 SIGPIPE（退出码 141/120），Worker 请直接读子进程 stdout。")
+    if ok:
+        print("\n✅ doctor：核心链路正常")
+    else:
+        print("\n❌ doctor：存在失败项，请检查网络/依赖（curl_cffi、akshare）")
+        sys.exit(1)
+
+
+def weekprob_cmd(args: List[str]) -> None:
+    """单票：约一周（5个交易日）收涨概率启发式估计。"""
+    ensure_state_files()
+    if not args:
+        print("用法: python3 hub.py weekprob <代码>")
+        sys.exit(1)
+    cfg = _load_json(_config_path(), _default_config())
+    ma_w = int(cfg.get("swing", {}).get("ma_window", 20))
+    code = _normalize_stock_code(args[0].strip())
+    stats = {}
+    try:
+        df_spot = _get_all_spot_df()
+        if df_spot is not None and not df_spot.empty:
+            stats = _breadth_stats_from_spot(df_spot)
+    except Exception:
+        pass
+    if stats:
+        stance, _ = _stance_from_stats(stats, cfg)
+    else:
+        stance = "unknown"
+    mctx = {"breadth_ratio": stats.get("ratio") if stats else None, "stance": stance}
+    s = _stock_daily_close_series(code)
+    out = {
+        "code": code,
+        "mechanical_stance": stance,
+        "breadth_ratio": stats.get("ratio") if stats else None,
+        "week_forward": _week_forward_prob_from_series(s, ma_w, mctx, cfg),
+        "generated_at": _now_str(),
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
 def main():
     ensure_state_files()
     if len(sys.argv) < 2:
         print("用法:")
-        print("  python hub.py data       # 纯JSON数据（含筛选+持仓）")
-        print("  python hub.py screen     # 选股筛选器")
-        print("  python hub.py trade [show|buy|sell|check|stats]")
-        print("  python hub.py morning")
-        print("  python hub.py scan")
-        print("  python hub.py close")
-        print("  python hub.py swing")
-        print("  python hub.py nightly")
-        print("  python hub.py watchlist [show|template|add-stock|...]")
+        print("  python3 hub.py data       # 纯JSON数据（含筛选+持仓）")
+        print("  python3 hub.py data-intel # 仅刷新情报（合并上一轮行情缓存，供休市轮询）")
+        print("  python3 hub.py screen     # 选股筛选器")
+        print("  python3 hub.py weekprob <代码>  # 单票约5日收涨概率（启发式）")
+        print("  python3 hub.py doctor     # 自检：东财K线、快照、hub K线链路")
+        print("  python3 hub.py trade [show|buy|sell|check|stats]")
+        print("  python3 hub.py morning")
+        print("  python3 hub.py scan")
+        print("  python3 hub.py close")
+        print("  python3 hub.py swing")
+        print("  python3 hub.py nightly")
+        print("  python3 hub.py watchlist [show|template|add-stock|...]")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
     if cmd == "data":
         data_dump()
+    elif cmd == "data-intel":
+        data_intel_only_dump()
+    elif cmd == "weekprob":
+        weekprob_cmd(sys.argv[2:])
+    elif cmd == "doctor":
+        doctor_cmd()
     elif cmd == "screen":
         screen_stocks()
     elif cmd == "trade":

@@ -7,7 +7,7 @@
 运行任何 skill 脚本前需安装依赖：
 
 ```bash
-pip install akshare pandas tabulate curl_cffi numpy
+python3 -m pip install akshare pandas tabulate curl_cffi numpy
 ```
 
 或者 `.codex/setup.sh` 会自动完成安装。
@@ -23,6 +23,31 @@ pip install akshare pandas tabulate curl_cffi numpy
 | a-stock-volatility | 涨跌停统计、市场情绪、异动 | 涨停、跌停、炸板、情绪、异动 |
 | a-stock-research-hub | 投研参谋中枢：多维推理分析（环境/题材/风格/持仓/剧本/风险）；短线复盘/scan；波段 swing 参谋 | 复盘、晨报、分析、没时间看盘、两周持有、军师 |
 | a-stock-shared | 共享数据模块（被其他 skill 依赖） | 不直接调用 |
+
+## Web 仪表盘
+
+本地运行投研仪表盘：
+
+```bash
+python3 -m pip install fastapi uvicorn openai anthropic
+python3 web/server.py
+# 浏览器打开 http://localhost:8888
+```
+
+说明：macOS 上常无 `python` 命令，请统一使用 **`python3`**。Worker 子进程会用当前解释器（`sys.executable`）调用 `hub.py data` 或 **`hub.py data-intel`**（休市时仅刷新情报、不重复拉全市场快照，轮询间隔可在设置里单独调长）。
+
+**交易日历**：Web Worker 用 **上交所交易日**（`akshare.tool_trade_date_hist_sina`，含法定长假与调休上班日），缓存在 `.codex/state/trade_calendar_sse.json`（约 7 天刷新）。可选覆盖文件 `.codex/state/trading_calendar_override.json`：
+
+```json
+{
+  "force_closed_dates": ["2026-10-02"],
+  "force_open_dates": []
+}
+```
+
+网络与缓存均不可用时，退化为「周一至周五」判断（长假仍可能不准，建议装好 akshare）。
+
+功能：大盘指数、市场广度/情绪、主线题材、选股推荐、AI 深度分析（可配置 LLM 后端）、交易日志。
 
 ## 注意事项
 

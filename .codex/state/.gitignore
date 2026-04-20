@@ -1,3 +1,10 @@
 alerts_seen.json
 market_last.json
 reports/
+llm_config.json
+analysis_latest.json
+worker_log.json
+monitor_latest.json
+monitor_log.txt
+*.tmp
+trade_calendar_sse.json
